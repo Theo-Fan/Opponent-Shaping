@@ -1,0 +1,20 @@
+# CPU-tested dependency set for this repository.
+# These versions were validated locally with `coin_train.py`.
+# If you want NVIDIA GPU JAX on Linux, replace the CPU JAX install
+# with the GPU-specific JAX install noted in the project instructions.
+
+numpy==1.26.4
+jax==0.4.25
+jaxlib==0.4.25
+flax==0.8.2
+optax==0.2.2
+hydra-core==1.3.2
+omegaconf==2.3.0
+wandb==0.25.1
+tabulate==0.10.0
+pillow==12.1.1
+matplotlib==3.10.8
+pandas==2.3.3
+fire==0.7.1
+tqdm==4.67.3
+torch==2.11.0

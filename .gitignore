@@ -1,0 +1,58 @@
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local environments and secrets
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Editor and OS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+.idea/
+.vscode/
+
+# Notebook scratch state
+.ipynb_checkpoints/
+
+# Training/runtime outputs
+experiments/
+outputs/
+wandb/
+logs/
+tmp/
+temp/
+runs/
+swanlog/
+
+# Generated checkpoints and learned weights
+checkpoints/
+reward_pth/
+ppo_preTrain/
+dqn_preTrain/
+q_preTrain/
+*.ckpt
+*.pth
+*.pt
+
+# Generated result dumps
+results/
+*.pkl
+*.pickle
+*.npy
+*.npz
+
+# Generated media artifacts
+Fixed_gifs/
+*.mp4
+*.gif
