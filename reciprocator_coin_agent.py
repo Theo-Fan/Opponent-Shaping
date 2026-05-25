@@ -1,7 +1,101 @@
 from flax import linen as nn
+import jax
 from jax import numpy as jp, random as rax
 
 from ipd import POLAGRU
+
+
+class CoinStateEncoder(nn.Module):
+    obs_shape: tuple
+    hidden_size: int
+    out_channels: int
+
+    @nn.compact
+    def __call__(self, obs):
+        obs = obs.reshape(self.obs_shape)
+        x = jp.transpose(obs, (1, 2, 0))
+        x = jp.pad(x, ((1, 1), (1, 1), (0, 0)), mode='wrap')
+        x = nn.Conv(self.out_channels, kernel_size=(3, 3), padding='VALID')(x)
+        x = nn.relu(x)
+        x = jp.pad(x, ((1, 1), (1, 1), (0, 0)), mode='wrap')
+        x = nn.Conv(self.out_channels, kernel_size=(3, 3), padding='VALID')(x)
+        x = nn.relu(x)
+        x = x.reshape(-1)
+        x = nn.Dense(self.hidden_size)(x)
+        return nn.relu(x)
+
+
+class ConvGRUActorCriticCoinAgent(nn.Module):
+    num_actions: int
+    obs_shape: tuple
+    hidden_size_actor: int
+    hidden_size_value: int
+    layers_before_gru_actor: int
+    layers_before_gru_value: int
+    conv_out_channels: int
+
+    def setup(self):
+        self.actor_encoder = CoinStateEncoder(
+            obs_shape=self.obs_shape,
+            hidden_size=self.hidden_size_actor,
+            out_channels=self.conv_out_channels,
+        )
+        self.value_encoder = CoinStateEncoder(
+            obs_shape=self.obs_shape,
+            hidden_size=self.hidden_size_value,
+            out_channels=self.conv_out_channels,
+        )
+        self.actor_head = POLAGRU(self.num_actions, self.hidden_size_actor, self.layers_before_gru_actor)
+        self.value_head = POLAGRU(1, self.hidden_size_value, self.layers_before_gru_value)
+
+    def __call__(self, x):
+        obs_seq = x['obs_seq']
+        rng = x['rng']
+        t = x['t']
+        self.call_seq({'obs_seq': obs_seq})
+        self.call_step({
+            'carry_actor': self.actor_head.get_initial_carry(),
+            'carry_qvalue': self.value_head.get_initial_carry(),
+            'obs': obs_seq[t],
+            'rng': rng,
+            't': t,
+        })
+
+    def get_initial_carries(self):
+        return {
+            'carry_actor': self.actor_head.get_initial_carry(),
+            'carry_qvalue': self.value_head.get_initial_carry(),
+        }
+
+    def call_seq(self, x):
+        actor_features = jax.vmap(self.actor_encoder)(x['obs_seq'])
+        value_features = jax.vmap(self.value_encoder)(x['obs_seq'])
+        logits_seq = self.actor_head(actor_features, carry=None)['hs']
+        logp_seq = nn.log_softmax(logits_seq, axis=-1)
+        t_seq = jp.arange(value_features.shape[0], dtype=value_features.dtype).reshape(-1, 1)
+        value_inputs = jp.concatenate([value_features, t_seq], axis=-1)
+        value_seq = self.value_head(value_inputs, carry=None)['hs'][..., 0]
+        return {'logp_seq': logp_seq, 'value_seq': value_seq}
+
+    def call_step(self, x):
+        obs = x['obs']
+        rng = x['rng']
+        t = x['t']
+        actor_features = self.actor_encoder(obs)
+        actor_res = self.actor_head(x=actor_features[None, :], carry=x['carry_actor'])
+        logp = nn.log_softmax(actor_res['hs'][0], axis=-1)
+        action = rax.categorical(rng, logp)
+
+        value_features = self.value_encoder(obs)
+        value_input = jp.concatenate([value_features, jp.array([t], dtype=value_features.dtype)], axis=-1)
+        value_res = self.value_head(x=value_input[None, :], carry=x['carry_qvalue'])
+        return {
+            'logp': logp,
+            'qvalue': jp.repeat(value_res['hs'][0, 0], self.num_actions),
+            'carry_actor': actor_res['carry'],
+            'carry_qvalue': value_res['carry'],
+            'action': action,
+        }
 
 
 class GRUActorCriticCoinAgent(nn.Module):

@@ -35,7 +35,7 @@ from coin_train import (
     scalar_mean,
     tree_concatenate,
 )
-from reciprocator_coin_agent import GRUActorCriticCoinAgent, ScalarPredictor
+from reciprocator_coin_agent import ConvGRUActorCriticCoinAgent, GRUActorCriticCoinAgent, ScalarPredictor
 from utils import clip_grads_by_norm, global_norm, npify, rscope, slurm_infos
 
 
@@ -63,12 +63,32 @@ RECIPROCAL_METRIC_FIELDNAMES = [
     'loss_voi_cf_q1',
     'mean_reciprocal_reward_player0',
     'mean_reciprocal_reward_player1',
+    'std_reciprocal_reward_player0',
+    'std_reciprocal_reward_player1',
+    'mean_abs_reciprocal_reward_player0',
+    'mean_abs_reciprocal_reward_player1',
     'mean_cumulative_reciprocal_reward_player0',
     'mean_cumulative_reciprocal_reward_player1',
+    'avg_env_return_player0',
+    'avg_env_return_player1',
+    'avg_shaped_return_player0',
+    'avg_shaped_return_player1',
+    'corr_reciprocal_reward_same_color_pickup_player0',
+    'corr_reciprocal_reward_same_color_pickup_player1',
+    'corr_reciprocal_reward_other_color_pickup_player0',
+    'corr_reciprocal_reward_other_color_pickup_player1',
     'mean_end_grudge_player0',
     'mean_end_grudge_player1',
     'mean_voi_0_on_1',
     'mean_voi_1_on_0',
+    'action_frequency_left_player0',
+    'action_frequency_right_player0',
+    'action_frequency_up_player0',
+    'action_frequency_down_player0',
+    'action_frequency_left_player1',
+    'action_frequency_right_player1',
+    'action_frequency_up_player1',
+    'action_frequency_down_player1',
 ]
 RECIPROCAL_CSV_FIELDNAMES = [
     *TRAIN_ITERATION_METRICS_FIELDNAMES,
@@ -78,6 +98,14 @@ RECIPROCAL_CSV_FIELDNAMES = [
 
 def categorical_entropy(logp):
     return -jp.sum(jp.nan_to_num(jp.exp(logp) * logp), axis=-1)
+
+
+def safe_corr(x, y):
+    x = x.reshape(-1)
+    y = y.reshape(-1)
+    x = x - x.mean()
+    y = y - y.mean()
+    return (x * y).mean() / (x.std() * y.std() + 1e-8)
 
 
 def discounted_returns_2d(rewards, gamma):
@@ -371,6 +399,56 @@ def make_compute_reciprocal_reward_fn(full_model, cf_model, reward_type, normali
     return compute
 
 
+@jax.jit
+def compute_reciprocator_diagnostics(episodes, reciprocal_rewards, total_rewards):
+    env_rewards = episodes['rew']
+    batch_size, trace_length = env_rewards.shape[:2]
+    coin_owner = episodes['coin_owner'][:, :-1, 0]
+    coin_pos = episodes['coin_pos'][:, :-1]
+    player0_pos = episodes['player1_pos'][:, 1:]
+    player1_pos = episodes['player2_pos'][:, 1:]
+    actions = episodes['act']
+
+    player0_takes = (player0_pos == coin_pos).all(axis=-1)
+    player1_takes = (player1_pos == coin_pos).all(axis=-1)
+    player0_same = player0_takes & (coin_owner == 0)
+    player1_same = player1_takes & (coin_owner == 1)
+    player0_other = player0_takes & (coin_owner == 1)
+    player1_other = player1_takes & (coin_owner == 0)
+
+    action_one_hot = jax.nn.one_hot(actions, 4).mean(axis=(0, 1))
+    return {
+        'std_reciprocal_reward_player0': reciprocal_rewards[:, :, 0].std(),
+        'std_reciprocal_reward_player1': reciprocal_rewards[:, :, 1].std(),
+        'mean_abs_reciprocal_reward_player0': jp.abs(reciprocal_rewards[:, :, 0]).mean(),
+        'mean_abs_reciprocal_reward_player1': jp.abs(reciprocal_rewards[:, :, 1]).mean(),
+        'avg_env_return_player0': env_rewards[:, :, 0].sum(axis=1).mean(),
+        'avg_env_return_player1': env_rewards[:, :, 1].sum(axis=1).mean(),
+        'avg_shaped_return_player0': total_rewards[:, :, 0].sum(axis=1).mean(),
+        'avg_shaped_return_player1': total_rewards[:, :, 1].sum(axis=1).mean(),
+        'corr_reciprocal_reward_same_color_pickup_player0': safe_corr(
+            reciprocal_rewards[:, :, 0], player0_same.astype(reciprocal_rewards.dtype)
+        ),
+        'corr_reciprocal_reward_same_color_pickup_player1': safe_corr(
+            reciprocal_rewards[:, :, 1], player1_same.astype(reciprocal_rewards.dtype)
+        ),
+        'corr_reciprocal_reward_other_color_pickup_player0': safe_corr(
+            reciprocal_rewards[:, :, 0], player0_other.astype(reciprocal_rewards.dtype)
+        ),
+        'corr_reciprocal_reward_other_color_pickup_player1': safe_corr(
+            reciprocal_rewards[:, :, 1], player1_other.astype(reciprocal_rewards.dtype)
+        ),
+        'action_frequency_left_player0': action_one_hot[0, 0],
+        'action_frequency_right_player0': action_one_hot[0, 1],
+        'action_frequency_up_player0': action_one_hot[0, 2],
+        'action_frequency_down_player0': action_one_hot[0, 3],
+        'action_frequency_left_player1': action_one_hot[1, 0],
+        'action_frequency_right_player1': action_one_hot[1, 1],
+        'action_frequency_up_player1': action_one_hot[1, 2],
+        'action_frequency_down_player1': action_one_hot[1, 3],
+    }
+
+
 def init_reciprocator_metrics_csv(save_path, hp):
     csv_path = os.path.join(save_path, get_metrics_csv_filename(hp))
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
@@ -509,13 +587,27 @@ def set_up_state_from_config(hp):
     rng, agent_rng, voi_rng = rax.split(rax.PRNGKey(hp['seed']), 3)
 
     policy_hp = hp['reciprocator']['policy']
-    agent_module = GRUActorCriticCoinAgent(
-        num_actions=dummy_env.NUM_ACTIONS,
-        hidden_size_actor=int(policy_hp['hidden_size_actor']),
-        hidden_size_value=int(policy_hp['hidden_size_value']),
-        layers_before_gru_actor=int(policy_hp['layers_before_gru_actor']),
-        layers_before_gru_value=int(policy_hp['layers_before_gru_value']),
-    )
+    policy_model = policy_hp.get('model', 'conv_gru')
+    if policy_model == 'conv_gru':
+        agent_module = ConvGRUActorCriticCoinAgent(
+            num_actions=dummy_env.NUM_ACTIONS,
+            obs_shape=tuple(dummy_env.OBS_SHAPE),
+            hidden_size_actor=int(policy_hp['hidden_size_actor']),
+            hidden_size_value=int(policy_hp['hidden_size_value']),
+            layers_before_gru_actor=int(policy_hp['layers_before_gru_actor']),
+            layers_before_gru_value=int(policy_hp['layers_before_gru_value']),
+            conv_out_channels=int(policy_hp['conv_out_channels']),
+        )
+    elif policy_model == 'gru':
+        agent_module = GRUActorCriticCoinAgent(
+            num_actions=dummy_env.NUM_ACTIONS,
+            hidden_size_actor=int(policy_hp['hidden_size_actor']),
+            hidden_size_value=int(policy_hp['hidden_size_value']),
+            layers_before_gru_actor=int(policy_hp['layers_before_gru_actor']),
+            layers_before_gru_value=int(policy_hp['layers_before_gru_value']),
+        )
+    else:
+        raise ValueError(f'Unknown Reciprocator policy model {policy_model}')
     agent_params = agent_module.init(agent_rng, {'obs_seq': dummy_obs_seq, 'rng': rax.PRNGKey(0), 't': 0})
     agent = CoinAgent(params=agent_params, model=agent_module, player=0)
     policy_optimizer = optax.adam(float(policy_hp['lr']))
@@ -659,6 +751,8 @@ def train(hp, log_wandb):
             for key, value in reciprocal_out.items()
             if key != 'reciprocal_rewards'
         })
+        diagnostic_metrics = compute_reciprocator_diagnostics(episodes, reciprocal_rewards, total_rewards)
+        update_metric_row.update({key: scalar_mean(value) for key, value in diagnostic_metrics.items()})
 
         if should_update_policy(i, hp):
             new_agent, new_opt_state, ppo_metrics = state['update_policy'](

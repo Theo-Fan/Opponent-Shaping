@@ -13,14 +13,16 @@ reciprocator:
   reciprocal_reward_weight: 1.0
   normalize_reciprocal_reward: True
   policy:
+    model: 'conv_gru'
     hidden_size_actor: 16
     hidden_size_value: 16
+    conv_out_channels: 4
     layers_before_gru_actor: 1
     layers_before_gru_value: 1
     lr: 0.005
     ppo_epochs: 5
     eps_clip: 0.15
-    entropy_weight: 0.01
+    entropy_weight: 0.05
     clip_grad_norm: 1.0
   influence:
     hidden_size: 64

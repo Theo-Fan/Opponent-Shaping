@@ -72,7 +72,7 @@ done
 
 ## JAX Reciprocator Self-Play on the Same Coin Game
 
-The JAX Reciprocator entry point uses the same modified 3x3 Coin Game setup as the LOQA command above: 200 steps per episode, 20 episodes per metric row, 4000 timesteps per CSV/W&B write, and 3e7 total environment timesteps.
+The JAX Reciprocator entry point uses the same modified 3x3 Coin Game setup as the LOQA command above: 200 steps per episode, 20 episodes per metric row, 4000 timesteps per CSV/W&B write, and 3e7 total environment timesteps. The default policy is a convolutional encoder plus GRU, closer to the original Reciprocator coin-game actor-critic than the earlier flatten-observation GRU.
 
 Run one seed:
 ```bash
@@ -95,7 +95,7 @@ done
 ```
 
 Reciprocator CSVs are saved as `experiments/<run_id>/selfplay_RECIPROCATOR_seed<seed>.csv`.
-
+The CSV also logs Reciprocator diagnostics such as reciprocal-reward std/mean-absolute value, shaped returns, pickup correlations, and per-action frequencies.
 
 
 
