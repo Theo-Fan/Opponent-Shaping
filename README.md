@@ -22,8 +22,6 @@ If you want to implement LOQA as a basline or if you want to improve upon LOQA, 
 
 
 # Recreating the LOQA Paper Results
-## Current 3x3 Coin Game LOQA Self-Play
-
 This repository is configured to run LOQA self-play on the modified 3x3 Coin Game:
 
 - each episode has 200 environment steps;
@@ -32,22 +30,55 @@ This repository is configured to run LOQA self-play on the modified 3x3 Coin Gam
 - metrics are written to `experiments/<run_id>/selfplay_LOQA_seed<seed>.csv`;
 - when W&B is enabled, `<run_id>` is the W&B run id.
 
-On the cluster `socialjax` environment, run:
-```python
+run:
+```bash
+conda activate socialjax 
+cd LOQA/
 python coin_train.py hp=loqa_iclr wandb.state=enabled "wandb.tags=[coin,loqa_3x3]"
 ```
 
-If you need to invoke the conda environment explicitly:
-```
-conda run -p /data/home/fzy/miniconda3/envs/socialjax python coin_train.py hp=loqa_iclr wandb.state=enabled "wandb.tags=[coin,loqa_3x3]"
-```
-
 For a short smoke test without W&B:
-```
-conda run -p /data/home/fzy/miniconda3/envs/socialjax python coin_train.py hp=loqa_iclr wandb.state=disabled hp.max_train_timestep=4000 hp.save_every=999999 hp.eval_every=999999
+```sh
+python coin_train.py hp=loqa_iclr wandb.state=disabled hp.max_train_timestep=4000 hp.save_every=999999 hp.eval_every=999999
 ```
 
-On a local machine where `socialjax` is located at `/opt/anaconda3/envs/socialjax`, use:
+---
+
+
+
+If experiment for 5 seeds, run:
+```bash
+cd LOQA/
+for seed in 21 22 23 24 25; do
+  python coin_train.py hp=loqa_iclr hp.seed=$seed wandb.state=enabled "wandb.tags=[coin,loqa_3x3,seed${seed}]"
+done
 ```
-conda run -p /opt/anaconda3/envs/socialjax python coin_train.py hp=loqa_iclr wandb.state=enabled "wandb.tags=[coin,loqa_3x3]"
+
+Collecting exp results, run: 
+
+```sh
+cd LOQA/
+
+for seed in 21 22 23 24 25; do
+  src=$(find experiments -name "selfplay_LOQA_seed${seed}.csv" | head -n 1)
+  if [ -n "$src" ]; then
+    cp "$src" ~/
+    echo "copied seed ${seed}: $src -> ~/selfplay_LOQA_seed${seed}.csv"
+  else
+    echo "missing seed ${seed}"
+  fi
+done
 ```
+
+
+
+
+
+
+
+
+
+
+
+
+
