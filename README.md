@@ -70,6 +70,31 @@ for seed in 21 22 23 24 25; do
 done
 ```
 
+## JAX Reciprocator Self-Play on the Same Coin Game
+
+The JAX Reciprocator entry point uses the same modified 3x3 Coin Game setup as the LOQA command above: 200 steps per episode, 20 episodes per metric row, 4000 timesteps per CSV/W&B write, and 3e7 total environment timesteps.
+
+Run one seed:
+```bash
+conda activate socialjax
+cd LOQA/
+python reciprocator_coin_train.py hp=reciprocator wandb.state=enabled "wandb.tags=[coin,reciprocator_3x3]"
+```
+
+Run a short smoke test without W&B:
+```bash
+python reciprocator_coin_train.py hp=reciprocator wandb.state=disabled hp.max_train_timestep=4000 hp.reciprocator.influence.num_initialization_iterations=0 hp.reciprocator.influence.target_period=1 hp.reciprocator.influence.target_epochs=1 hp.reciprocator.influence.num_train_batches=1 hp.reciprocator.influence.target_batch_size=512 hp.save_every=999999 hp.eval_every=999999
+```
+
+Run five seeds:
+```bash
+cd LOQA/
+for seed in 21 22 23 24 25; do
+  python reciprocator_coin_train.py hp=reciprocator hp.seed=$seed wandb.state=enabled "wandb.tags=[coin,reciprocator_3x3,seed${seed}]"
+done
+```
+
+Reciprocator CSVs are saved as `experiments/<run_id>/selfplay_RECIPROCATOR_seed<seed>.csv`.
 
 
 
