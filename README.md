@@ -29,7 +29,7 @@ This repository is configured to run LOQA self-play on the modified 3x3 Coin Gam
 - each episode has 200 environment steps;
 - each CSV/W&B row averages 20 episodes, i.e. 4000 environment timesteps;
 - total training lasts 3e7 environment timesteps;
-- metrics are written to `experiments/<run_id>/train_iteration_metrics.csv`;
+- metrics are written to `experiments/<run_id>/selfplay_LOQA_seed<seed>.csv`;
 - when W&B is enabled, `<run_id>` is the W&B run id.
 
 On the cluster `socialjax` environment, run:

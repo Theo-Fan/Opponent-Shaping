@@ -215,8 +215,16 @@ def flatten_player_stats(statistics):
     return flattened
 
 
-def init_iteration_metrics_csv(save_path):
-    csv_path = os.path.join(save_path, 'train_iteration_metrics.csv')
+def get_metrics_csv_filename(hp):
+    if hp['just_self_play']:
+        run_label = f'selfplay_{str(hp["agent_0"]).upper()}'
+    else:
+        run_label = f'{str(hp["agent_0"]).upper()}_vs_{str(hp["agent_1"]).upper()}'
+    return f'{run_label}_seed{int(hp["seed"])}.csv'
+
+
+def init_iteration_metrics_csv(save_path, hp):
+    csv_path = os.path.join(save_path, get_metrics_csv_filename(hp))
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=TRAIN_ITERATION_METRICS_FIELDNAMES)
         writer.writeheader()
@@ -514,7 +522,8 @@ def train(hp, log_wandb):
     # extract params for resetting in future
     agent0_params = state['agent0'].params
     agent1_params = state['agent1'].params
-    iteration_metrics_csv_path = init_iteration_metrics_csv(save_path)
+    iteration_metrics_csv_path = init_iteration_metrics_csv(save_path, hp)
+    print(f'metrics csv path: {iteration_metrics_csv_path}')
 
     dummy_env, _ = CoinGame.init(
         rng=rax.PRNGKey(hp['seed']),
