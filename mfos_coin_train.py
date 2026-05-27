@@ -307,6 +307,13 @@ def build_policy_data(episodes, gamma, inner_episode_length, player_id):
     }
 
 
+@partial(jax.jit, static_argnames=('inner_episode_length',))
+def build_shared_policy_data(episodes, gamma, inner_episode_length):
+    data0 = build_policy_data(episodes, gamma, inner_episode_length, 0)
+    data1 = build_policy_data(episodes, gamma, inner_episode_length, 1)
+    return jax.tree_map(lambda a, b: jp.concatenate([a, b], axis=0), data0, data1)
+
+
 def make_update_mfos_policy_fn(
         optimizer,
         gamma,
@@ -318,7 +325,10 @@ def make_update_mfos_policy_fn(
 ):
     @partial(jax.jit, static_argnames=('player_id',))
     def update(agent, opt_state, episodes, player_id):
-        data = build_policy_data(episodes, gamma, inner_episode_length, player_id)
+        if player_id == -1:
+            data = build_shared_policy_data(episodes, gamma, inner_episode_length)
+        else:
+            data = build_policy_data(episodes, gamma, inner_episode_length, player_id)
 
         def loss_fn(a):
             outputs = a.evaluate_agent_sequences({'state_seq': data['state_seq']})
@@ -471,7 +481,7 @@ def set_up_state_from_config(hp):
         ),
         dtype=jp.float32,
     )
-    rng, agent0_rng, agent1_rng = rax.split(rax.PRNGKey(hp['seed']), 3)
+    rng, agent_rng = rax.split(rax.PRNGKey(hp['seed']), 2)
 
     mfos_hp = hp['mfos']
     agent_module = MFOSCoinAgent(
@@ -481,13 +491,11 @@ def set_up_state_from_config(hp):
         out_channels=int(mfos_hp['out_channels']),
         layers_before_gru=int(mfos_hp['layers_before_gru']),
     )
-    agent0_params = agent_module.init(agent0_rng, {'state_seq': dummy_state_seq, 'rng': rax.PRNGKey(0)})
-    agent1_params = agent_module.init(agent1_rng, {'state_seq': dummy_state_seq, 'rng': rax.PRNGKey(1)})
-    agent0 = CoinAgent(params=agent0_params, model=agent_module, player=0)
-    agent1 = CoinAgent(params=agent1_params, model=agent_module, player=1)
+    shared_params = agent_module.init(agent_rng, {'state_seq': dummy_state_seq, 'rng': rax.PRNGKey(0)})
+    agent0 = CoinAgent(params=shared_params, model=agent_module, player=0)
+    agent1 = agent0.replace(player=1)
     optimizer = optax.adam(float(mfos_hp['lr']))
     agent0_opt = Optimizer(optimizer, optimizer.init(agent0))
-    agent1_opt = Optimizer(optimizer, optimizer.init(agent1))
     update_policy = make_update_mfos_policy_fn(
         optimizer,
         float(hp['reward_discount']),
@@ -502,7 +510,6 @@ def set_up_state_from_config(hp):
         'agent0': agent0,
         'agent1': agent1,
         'agent0_opt': agent0_opt,
-        'agent1_opt': agent1_opt,
         'update_policy': update_policy,
         'mfos_input_shape': tuple(mfos_input_shape),
     }
@@ -547,7 +554,7 @@ def train(hp, log_wandb):
     expected_metric_rows = int(np.ceil(total_training_timesteps / metrics_log_timestep_freq))
     state = set_up_state_from_config(hp)
 
-    print('****mfos self play (jax)****')
+    print('****mfos shared-parameter self play (jax)****')
     print(f'num training iterations: {num_training_iterations}')
     print(f'episodes per iteration: {episodes_per_iteration}')
     print(f'episode length: {episode_length} timesteps')
@@ -587,26 +594,16 @@ def train(hp, log_wandb):
         )
         metric_window_batches.append(episodes)
 
-        new_agent0, new_opt0_state, update0_metrics = state['update_policy'](
+        new_agent0, new_opt0_state, update_metrics = state['update_policy'](
             state['agent0'],
             state['agent0_opt'].opt_state,
             episodes,
-            0,
+            -1,
         )
-        new_agent1, new_opt1_state, update1_metrics = state['update_policy'](
-            state['agent1'],
-            state['agent1_opt'].opt_state,
-            episodes,
-            1,
-        )
-        state['agent0'] = new_agent0
-        state['agent1'] = new_agent1
+        state['agent0'] = new_agent0.replace(player=0)
+        state['agent1'] = state['agent0'].replace(player=1)
         state['agent0_opt'] = state['agent0_opt'].replace(opt_state=new_opt0_state)
-        state['agent1_opt'] = state['agent1_opt'].replace(opt_state=new_opt1_state)
-        update_metric_row = {
-            key: float(np.mean([scalar_mean(update0_metrics[key]), scalar_mean(update1_metrics[key])]))
-            for key in update0_metrics
-        }
+        update_metric_row = {key: scalar_mean(value) for key, value in update_metrics.items()}
         diagnostics = compute_mfos_diagnostics(episodes, theta_metrics)
         update_metric_row.update({key: scalar_mean(value) for key, value in diagnostics.items()})
 
