@@ -82,8 +82,7 @@ class MFOSCoinAgent(nn.Module):
         features = jax.vmap(self.theta_encoder)(flat_state)
         features = features.reshape(batch_size, inner_steps, self.hidden_size)
         last_h = jax.vmap(lambda seq: self.theta_head(seq, carry=None)['hs'][-1])(features)
-        theta_source = jp.repeat(last_h.mean(axis=0, keepdims=True), batch_size, axis=0)
-        return nn.sigmoid(jax.vmap(self.theta_out)(theta_source))
+        return nn.sigmoid(jax.vmap(self.theta_out)(last_h))
 
     def call_step(self, x):
         state = x['state']

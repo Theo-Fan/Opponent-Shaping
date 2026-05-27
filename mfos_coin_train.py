@@ -42,6 +42,8 @@ MFOS_METRIC_FIELDNAMES = [
     'loss_mfos_value',
     'mfos_entropy',
     'grad_mfos_norm',
+    'mfos_approx_kl',
+    'mfos_clip_fraction',
     'theta_mean',
     'theta_std',
     'action_frequency_left_player0',
@@ -285,7 +287,7 @@ def mfos_discounted_returns(rewards, gamma, inner_episode_length):
 
 
 @partial(jax.jit, static_argnames=('inner_episode_length', 'player_id'))
-def build_policy_data(episodes, gamma, inner_episode_length, player_id):
+def build_policy_data(episodes, gamma, inner_episode_length, player_id, other_reward_coef):
     batch_size, metric_episode_length = episodes['act'].shape[:2]
     num_inner_episodes = metric_episode_length // inner_episode_length
     state_seq = episodes['mfos_state'][:, :, player_id].reshape(
@@ -297,7 +299,13 @@ def build_policy_data(episodes, gamma, inner_episode_length, player_id):
     action_seq = episodes['act'][:, :, player_id].reshape(batch_size, num_inner_episodes, inner_episode_length)
     taken_logps = jp.take_along_axis(episodes['logp'], episodes['act'][..., None], axis=-1)[..., 0]
     old_logp_seq = taken_logps[:, :, player_id].reshape(batch_size, num_inner_episodes, inner_episode_length)
-    rewards = episodes['rew'][:, :, player_id].reshape(batch_size, num_inner_episodes, inner_episode_length)
+    own_rewards = episodes['rew'][:, :, player_id]
+    other_rewards = episodes['rew'][:, :, 1 - player_id]
+    rewards = (own_rewards + other_reward_coef * other_rewards).reshape(
+        batch_size,
+        num_inner_episodes,
+        inner_episode_length,
+    )
     returns = mfos_discounted_returns(rewards, gamma, inner_episode_length)
     return {
         'state_seq': state_seq,
@@ -308,9 +316,9 @@ def build_policy_data(episodes, gamma, inner_episode_length, player_id):
 
 
 @partial(jax.jit, static_argnames=('inner_episode_length',))
-def build_shared_policy_data(episodes, gamma, inner_episode_length):
-    data0 = build_policy_data(episodes, gamma, inner_episode_length, 0)
-    data1 = build_policy_data(episodes, gamma, inner_episode_length, 1)
+def build_shared_policy_data(episodes, gamma, inner_episode_length, other_reward_coef):
+    data0 = build_policy_data(episodes, gamma, inner_episode_length, 0, other_reward_coef)
+    data1 = build_policy_data(episodes, gamma, inner_episode_length, 1, other_reward_coef)
     return jax.tree_map(lambda a, b: jp.concatenate([a, b], axis=0), data0, data1)
 
 
@@ -322,13 +330,14 @@ def make_update_mfos_policy_fn(
         num_epochs,
         clip_grad_norm,
         inner_episode_length,
+        other_reward_coef,
 ):
     @partial(jax.jit, static_argnames=('player_id',))
     def update(agent, opt_state, episodes, player_id):
         if player_id == -1:
-            data = build_shared_policy_data(episodes, gamma, inner_episode_length)
+            data = build_shared_policy_data(episodes, gamma, inner_episode_length, other_reward_coef)
         else:
-            data = build_policy_data(episodes, gamma, inner_episode_length, player_id)
+            data = build_policy_data(episodes, gamma, inner_episode_length, player_id, other_reward_coef)
 
         def loss_fn(a):
             outputs = a.evaluate_agent_sequences({'state_seq': data['state_seq']})
@@ -340,6 +349,8 @@ def make_update_mfos_policy_fn(
                 axis=-1,
             )[..., 0]
             ratios = jp.exp(new_logp_seq - data['old_logp_seq'])
+            approx_kl = (data['old_logp_seq'] - new_logp_seq).mean()
+            clip_fraction = (jp.abs(ratios - 1.0) > eps_clip).mean()
             advantages = data['return_seq'] - jax.lax.stop_gradient(value_seq)
             surrogate1 = ratios * advantages
             surrogate2 = jp.clip(ratios, 1.0 - eps_clip, 1.0 + eps_clip) * advantages
@@ -351,6 +362,8 @@ def make_update_mfos_policy_fn(
                 'loss_mfos_policy': policy_loss,
                 'loss_mfos_value': value_loss,
                 'mfos_entropy': entropy,
+                'mfos_approx_kl': approx_kl,
+                'mfos_clip_fraction': clip_fraction,
             }
 
         def epoch_body(carry, _):
@@ -504,6 +517,7 @@ def set_up_state_from_config(hp):
         int(mfos_hp['ppo_epochs']),
         float(mfos_hp['clip_grad_norm']) if 'clip_grad_norm' in mfos_hp else None,
         inner_episode_length,
+        float(mfos_hp.get('other_reward_coef', 0.0)),
     )
     return {
         'rng': rng,
