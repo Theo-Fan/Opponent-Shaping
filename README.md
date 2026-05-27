@@ -102,11 +102,18 @@ The CSV also logs Reciprocator diagnostics such as reciprocal-reward std/mean-ab
 
 The JAX MFOS entry point uses the same 3x3 Coin Game, 200-step metric episodes, 20 metric episodes per CSV/W&B row, 4000 timesteps per row, and 3e7 total environment timesteps. The default run writes 7500 CSV/W&B rows. Internally it follows the official MFOS self-play structure with two independent MFOS learners, separate optimizers, environment resets at each MFOS inner-episode boundary, batch-averaged theta updates from the previous inner trajectory, and MFOS-style PPO returns. Each 200-step metric episode is aggregated from 10 MFOS inner episodes of 20 steps (`hp.mfos.inner_episode_length=20`), so metrics remain computed over fixed 200-step windows.
 
+For smoother MFOS curves, logging and PPO updates are intentionally decoupled: CSV/W&B still logs every 4000 timesteps, while PPO defaults to one update every 5 metric windows (`hp.mfos.update_interval_iterations=5`, 20000 timesteps/update). The default MFOS PPO step is also conservative (`lr=1e-4`, `ppo_epochs=8`, `eps_clip=0.1`, `clip_grad_norm=0.5`) to reduce late-training oscillation.
+
 Run one seed:
 ```bash
 conda activate socialjax
 cd LOQA/
 python mfos_coin_train.py hp=mfos wandb.state=enabled "wandb.tags=[coin,mfos_3x3]"
+```
+
+Run one seed with explicit stability overrides:
+```bash
+python mfos_coin_train.py hp=mfos hp.mfos.update_interval_iterations=5 hp.mfos.lr=0.0001 hp.mfos.ppo_epochs=8 hp.mfos.eps_clip=0.1 hp.mfos.clip_grad_norm=0.5 wandb.state=enabled "wandb.tags=[coin,mfos_3x3,stable]"
 ```
 
 Run a short smoke test without W&B:
@@ -124,7 +131,6 @@ done
 
 MFOS CSVs are saved as `experiments/<run_id>/selfplay_MFOS_seed<seed>.csv`.
 The CSV also logs MFOS diagnostics such as PPO loss, entropy, gradient norm, theta mean/std, and per-action frequencies.
-
 
 
 
