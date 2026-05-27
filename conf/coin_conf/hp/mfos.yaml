@@ -19,4 +19,3 @@ mfos:
   eps_clip: 0.2
   entropy_weight: 0.0
   clip_grad_norm: 1.0
-  other_reward_coef: 0.5

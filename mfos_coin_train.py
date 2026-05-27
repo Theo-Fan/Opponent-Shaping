@@ -287,7 +287,7 @@ def mfos_discounted_returns(rewards, gamma, inner_episode_length):
 
 
 @partial(jax.jit, static_argnames=('inner_episode_length', 'player_id'))
-def build_policy_data(episodes, gamma, inner_episode_length, player_id, other_reward_coef):
+def build_policy_data(episodes, gamma, inner_episode_length, player_id):
     batch_size, metric_episode_length = episodes['act'].shape[:2]
     num_inner_episodes = metric_episode_length // inner_episode_length
     state_seq = episodes['mfos_state'][:, :, player_id].reshape(
@@ -299,9 +299,7 @@ def build_policy_data(episodes, gamma, inner_episode_length, player_id, other_re
     action_seq = episodes['act'][:, :, player_id].reshape(batch_size, num_inner_episodes, inner_episode_length)
     taken_logps = jp.take_along_axis(episodes['logp'], episodes['act'][..., None], axis=-1)[..., 0]
     old_logp_seq = taken_logps[:, :, player_id].reshape(batch_size, num_inner_episodes, inner_episode_length)
-    own_rewards = episodes['rew'][:, :, player_id]
-    other_rewards = episodes['rew'][:, :, 1 - player_id]
-    rewards = (own_rewards + other_reward_coef * other_rewards).reshape(
+    rewards = episodes['rew'][:, :, player_id].reshape(
         batch_size,
         num_inner_episodes,
         inner_episode_length,
@@ -316,9 +314,9 @@ def build_policy_data(episodes, gamma, inner_episode_length, player_id, other_re
 
 
 @partial(jax.jit, static_argnames=('inner_episode_length',))
-def build_shared_policy_data(episodes, gamma, inner_episode_length, other_reward_coef):
-    data0 = build_policy_data(episodes, gamma, inner_episode_length, 0, other_reward_coef)
-    data1 = build_policy_data(episodes, gamma, inner_episode_length, 1, other_reward_coef)
+def build_shared_policy_data(episodes, gamma, inner_episode_length):
+    data0 = build_policy_data(episodes, gamma, inner_episode_length, 0)
+    data1 = build_policy_data(episodes, gamma, inner_episode_length, 1)
     return jax.tree_map(lambda a, b: jp.concatenate([a, b], axis=0), data0, data1)
 
 
@@ -330,14 +328,13 @@ def make_update_mfos_policy_fn(
         num_epochs,
         clip_grad_norm,
         inner_episode_length,
-        other_reward_coef,
 ):
     @partial(jax.jit, static_argnames=('player_id',))
     def update(agent, opt_state, episodes, player_id):
         if player_id == -1:
-            data = build_shared_policy_data(episodes, gamma, inner_episode_length, other_reward_coef)
+            data = build_shared_policy_data(episodes, gamma, inner_episode_length)
         else:
-            data = build_policy_data(episodes, gamma, inner_episode_length, player_id, other_reward_coef)
+            data = build_policy_data(episodes, gamma, inner_episode_length, player_id)
 
         def loss_fn(a):
             outputs = a.evaluate_agent_sequences({'state_seq': data['state_seq']})
@@ -517,7 +514,6 @@ def set_up_state_from_config(hp):
         int(mfos_hp['ppo_epochs']),
         float(mfos_hp['clip_grad_norm']) if 'clip_grad_norm' in mfos_hp else None,
         inner_episode_length,
-        float(mfos_hp.get('other_reward_coef', 0.0)),
     )
     return {
         'rng': rng,
