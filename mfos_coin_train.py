@@ -102,6 +102,24 @@ def concatenate_episode_batches(episode_batches):
     return jax.tree_util.tree_map(lambda *xs: jp.concatenate(xs, axis=0), *episode_batches)
 
 
+def make_mfos_learning_rate(hp):
+    mfos_hp = hp['mfos']
+    initial_lr = float(mfos_hp['lr'])
+    final_lr = float(mfos_hp.get('lr_final', initial_lr))
+    if final_lr == initial_lr:
+        return initial_lr
+
+    num_policy_updates = int(np.ceil(get_num_training_iterations(hp) / get_mfos_update_interval_iterations(hp)))
+    num_optimizer_steps = max(1, num_policy_updates * int(mfos_hp['ppo_epochs']))
+    decay_fraction = float(mfos_hp.get('lr_decay_fraction', 1.0))
+    transition_steps = max(1, int(num_optimizer_steps * decay_fraction))
+    return optax.linear_schedule(
+        init_value=initial_lr,
+        end_value=final_lr,
+        transition_steps=transition_steps,
+    )
+
+
 def batch_initial_carry(carry, batch_size):
     return jax.tree_map(lambda x: jp.repeat(x[None], batch_size, axis=0), carry)
 
@@ -498,7 +516,7 @@ def set_up_state_from_config(hp):
     agent1_params = agent_module.init(agent1_rng, {'state_seq': dummy_state_seq, 'rng': rax.PRNGKey(1)})
     agent0 = CoinAgent(params=agent0_params, model=agent_module, player=0)
     agent1 = CoinAgent(params=agent1_params, model=agent_module, player=1)
-    optimizer = optax.adam(float(mfos_hp['lr']))
+    optimizer = optax.adam(make_mfos_learning_rate(hp))
     agent0_opt = Optimizer(optimizer, optimizer.init(agent0))
     agent1_opt = Optimizer(optimizer, optimizer.init(agent1))
     update_policy = make_update_mfos_policy_fn(
