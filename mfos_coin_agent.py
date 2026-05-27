@@ -46,10 +46,12 @@ class MFOSCoinAgent(nn.Module):
     def __call__(self, x):
         state_seq = x['state_seq']
         rng = x['rng']
-        if state_seq.ndim == 4:
-            self.evaluate_meta_sequences({'state_seq': state_seq})
-        else:
+        if state_seq.ndim == 5:
             self.evaluate_batched_meta_sequences({'state_seq': state_seq})
+        elif state_seq.ndim == 4:
+            self.evaluate_agent_sequences({'state_seq': state_seq})
+        else:
+            self.evaluate_meta_sequences({'state_seq': state_seq})
         self.call_step({
             'state': state_seq.reshape(-1, state_seq.shape[-1])[0],
             'theta': self.get_initial_theta(),
@@ -72,6 +74,16 @@ class MFOSCoinAgent(nn.Module):
         features = jax.vmap(self.theta_encoder)(state_seq)
         hs = self.theta_head(features, carry=None)['hs']
         return nn.sigmoid(self.theta_out(hs[-1]))
+
+    def theta_from_batch_seq(self, x):
+        state_seq = x['state_seq']
+        batch_size, inner_steps, state_dim = state_seq.shape
+        flat_state = state_seq.reshape(batch_size * inner_steps, state_dim)
+        features = jax.vmap(self.theta_encoder)(flat_state)
+        features = features.reshape(batch_size, inner_steps, self.hidden_size)
+        last_h = jax.vmap(lambda seq: self.theta_head(seq, carry=None)['hs'][-1])(features)
+        theta_source = jp.repeat(last_h.mean(axis=0, keepdims=True), batch_size, axis=0)
+        return nn.sigmoid(jax.vmap(self.theta_out)(theta_source))
 
     def call_step(self, x):
         state = x['state']
@@ -190,4 +202,45 @@ class MFOSCoinAgent(nn.Module):
             num_players, batch_size, outer_steps, inner_steps, self.num_actions
         )
         value_seq = values.reshape(num_players, batch_size, outer_steps, inner_steps)
+        return {'logp_seq': logp_seq, 'value_seq': value_seq, 'theta_seq': theta}
+
+    def evaluate_agent_sequences(self, x):
+        state_seq = x['state_seq']
+        batch_size, outer_steps, inner_steps, state_dim = state_seq.shape
+
+        theta_current = jax.vmap(
+            lambda seq: self.theta_from_batch_seq({'state_seq': seq}),
+            in_axes=1,
+            out_axes=1,
+        )(state_seq)
+        theta0 = jp.ones((batch_size, 1, self.hidden_size), dtype=state_seq.dtype)
+        theta = jp.concatenate([theta0, theta_current[:, :-1]], axis=1)
+
+        flat_state = state_seq.reshape(batch_size * outer_steps * inner_steps, state_dim)
+        actor_features = jax.vmap(self.actor_encoder)(flat_state)
+        value_features = jax.vmap(self.value_encoder)(flat_state)
+        actor_features = actor_features.reshape(batch_size, outer_steps, inner_steps, self.hidden_size)
+        value_features = value_features.reshape(batch_size, outer_steps, inner_steps, self.hidden_size)
+
+        def run_actor(seq):
+            return self.actor_head(seq, carry=None)['hs']
+
+        def run_value(seq):
+            return self.value_head(seq, carry=None)['hs']
+
+        actor_hidden = jax.vmap(jax.vmap(run_actor, in_axes=0), in_axes=0)(actor_features)
+        value_hidden = jax.vmap(jax.vmap(run_value, in_axes=0), in_axes=0)(value_features)
+
+        actor_hidden = nn.relu(actor_hidden) * theta[:, :, None, :]
+        value_hidden = nn.relu(value_hidden) * jax.lax.stop_gradient(theta[:, :, None, :])
+
+        flat_actor_hidden = actor_hidden.reshape(batch_size * outer_steps * inner_steps, self.hidden_size)
+        flat_value_hidden = value_hidden.reshape(batch_size * outer_steps * inner_steps, self.hidden_size)
+        logits = jax.vmap(self.actor_logits)(flat_actor_hidden)
+        values = jax.vmap(self.value_out)(flat_value_hidden)[..., 0]
+
+        logp_seq = nn.log_softmax(logits, axis=-1).reshape(
+            batch_size, outer_steps, inner_steps, self.num_actions
+        )
+        value_seq = values.reshape(batch_size, outer_steps, inner_steps)
         return {'logp_seq': logp_seq, 'value_seq': value_seq, 'theta_seq': theta}

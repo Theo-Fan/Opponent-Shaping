@@ -18,11 +18,10 @@ from omegaconf import DictConfig, OmegaConf
 
 import wandb
 from coin_agent import CoinAgent
-from coin_game import CoinGame, coin_game_params, episode_stats, make_zero_episode
+from coin_game import MOVES, CoinGame, coin_game_params
 from coin_train import (
     Optimizer,
     TRAIN_ITERATION_METRICS_FIELDNAMES,
-    compute_iteration_metric_row,
     format_wandb_metrics,
     get_metrics_csv_filename,
     get_metrics_log_timestep_freq,
@@ -32,7 +31,6 @@ from coin_train import (
     get_total_training_episodes,
     get_total_training_timesteps,
     scalar_mean,
-    tree_concatenate,
 )
 from mfos_coin_agent import MFOSCoinAgent
 from utils import clip_grads_by_norm, global_norm, npify, rscope, slurm_infos
@@ -65,21 +63,6 @@ def categorical_entropy(logp):
     return -jp.sum(jp.nan_to_num(jp.exp(logp) * logp), axis=-1)
 
 
-def discounted_returns_flat(rewards, gamma):
-    rewards_time_major = rewards.T
-
-    def body(carry, reward_t):
-        value = reward_t + gamma * carry
-        return value, value
-
-    _, returns_reversed = jax.lax.scan(
-        body,
-        jp.zeros_like(rewards_time_major[0]),
-        jp.flip(rewards_time_major, axis=0),
-    )
-    return jp.flip(returns_reversed, axis=0).T
-
-
 def init_mfos_metrics_csv(save_path, hp):
     csv_path = os.path.join(save_path, get_metrics_csv_filename(hp))
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
@@ -102,219 +85,220 @@ def make_mfos_state(obs, own_previous_reward, other_previous_reward, done, heigh
     return jp.concatenate([obs, own_reward_channel, other_reward_channel, done_channel], axis=0)
 
 
-def make_zero_mfos_episode(trace_length, coin_game, mfos_input_shape):
-    episode = make_zero_episode(trace_length=trace_length, coin_game=coin_game)
-    episode['mfos_state'] = jp.zeros(
-        [trace_length, 2, *mfos_input_shape],
-        dtype=episode['obs'].dtype,
-    )
-    return episode
-
-
 def get_mfos_inner_episode_length(hp):
     return int(hp['mfos'].get('inner_episode_length', hp['game']['game_length']))
 
 
-@partial(
-    jax.jit,
-    static_argnames=(
-        'metric_episode_length',
-        'inner_episode_length',
-        'height',
-        'width',
-        'mfos_input_shape',
-    ),
-)
-def play_mfos_metric_episode(
-        agent,
-        rng,
-        env,
-        metric_episode_length,
-        inner_episode_length,
-        height,
-        width,
-        mfos_input_shape,
-):
-    episode = make_zero_mfos_episode(metric_episode_length, env, mfos_input_shape)
-    episode['obs'] = episode['obs'].at[0].set(env.get_obs())
-    episode['coin_pos'] = episode['coin_pos'].at[0].set(env.coin_pos)
-    episode['coin_owner'] = episode['coin_owner'].at[0].set(env.coin_owner)
-    episode['player1_pos'] = episode['player1_pos'].at[0].set(env.players_pos[0])
-    episode['player2_pos'] = episode['player2_pos'].at[0].set(env.players_pos[1])
-    previous_rewards = jp.zeros((2,), dtype=episode['rew'].dtype)
-    theta_init = agent.get_initial_theta()
+def batch_initial_carry(carry, batch_size):
+    return jax.tree_map(lambda x: jp.repeat(x[None], batch_size, axis=0), carry)
 
-    def scan_inner_episode(carry, _):
-        env, rng, episode, global_t, previous_rewards, theta0, theta1 = carry
-        carries0 = agent.get_initial_carries()
-        carries1 = agent.get_initial_carries()
 
-        def body_fn(inner_carry, _):
-            env, rng, episode, t, previous_rewards, c0_actor, c0_value, c1_actor, c1_value = inner_carry
+@partial(jax.jit, static_argnames=('hp', 'mfos_input_shape'))
+def generate_mfos_episodes(agent0, agent1, rng, hp, mfos_input_shape):
+    batch_size = hp['batch_size']
+    metric_episode_length = hp['game']['game_length']
+    inner_episode_length = get_mfos_inner_episode_length(hp)
+    num_inner_episodes = metric_episode_length // inner_episode_length
+    height = hp['game']['height']
+    width = hp['game']['width']
+    state_dtype = jp.float32
+    theta0_init = jp.repeat(agent0.get_initial_theta()[None], batch_size, axis=0)
+    theta1_init = jp.repeat(agent1.get_initial_theta()[None], batch_size, axis=0)
+
+    def run_inner_episode(carry, _):
+        rng, theta0, theta1 = carry
+        rng, env_rng, play_rng = rax.split(rng, 3)
+        env_rngs = rax.split(env_rng, batch_size)
+        env = jax.vmap(lambda r: CoinGame.init(rng=r, **coin_game_params(hp))[0])(env_rngs)
+        obs = jax.vmap(lambda e: e.get_obs())(env)
+        previous_rewards = jp.zeros((batch_size, 2), dtype=state_dtype)
+        carries0 = agent0.get_initial_carries()
+        carries1 = agent1.get_initial_carries()
+        c0_actor = batch_initial_carry(carries0['carry_actor'], batch_size)
+        c0_value = batch_initial_carry(carries0['carry_value'], batch_size)
+        c1_actor = batch_initial_carry(carries1['carry_actor'], batch_size)
+        c1_value = batch_initial_carry(carries1['carry_value'], batch_size)
+
+        def step_fn(step_carry, _):
+            env, obs, rng, previous_rewards, c0_actor, c0_value, c1_actor, c1_value = step_carry
             rng, rng0, rng1 = rax.split(rng, 3)
-            episode['games'] = jax.tree_map(lambda x, o: x.at[t].set(o), episode['games'], env)
-
-            state0 = make_mfos_state(
-                episode['obs'][t, 0],
-                previous_rewards[0],
-                previous_rewards[1],
+            rng0 = rax.split(rng0, batch_size)
+            rng1 = rax.split(rng1, batch_size)
+            state0 = jax.vmap(make_mfos_state, in_axes=(0, 0, 0, None, None, None))(
+                obs[:, 0],
+                previous_rewards[:, 0],
+                previous_rewards[:, 1],
                 0.,
                 height,
                 width,
             )
-            state1 = make_mfos_state(
-                episode['obs'][t, 1],
-                previous_rewards[1],
-                previous_rewards[0],
+            state1 = jax.vmap(make_mfos_state, in_axes=(0, 0, 0, None, None, None))(
+                obs[:, 1],
+                previous_rewards[:, 1],
+                previous_rewards[:, 0],
                 0.,
                 height,
                 width,
             )
-            out0 = agent.call_step({
-                'state': state0.reshape(-1),
-                'theta': theta0,
-                'carry_actor': c0_actor,
-                'carry_value': c0_value,
-                'rng': rng0,
-            })
-            out1 = agent.call_step({
-                'state': state1.reshape(-1),
-                'theta': theta1,
-                'carry_actor': c1_actor,
-                'carry_value': c1_value,
-                'rng': rng1,
-            })
-            actions = jp.stack([out0['action'], out1['action']])
-            logp = jp.stack([out0['logp'], out1['logp']], axis=0)
+            out0 = jax.vmap(
+                lambda s, th, ca, cv, r: agent0.call_step({
+                    'state': s.reshape(-1),
+                    'theta': th,
+                    'carry_actor': ca,
+                    'carry_value': cv,
+                    'rng': r,
+                })
+            )(state0, theta0, c0_actor, c0_value, rng0)
+            out1 = jax.vmap(
+                lambda s, th, ca, cv, r: agent1.call_step({
+                    'state': s.reshape(-1),
+                    'theta': th,
+                    'carry_actor': ca,
+                    'carry_value': cv,
+                    'rng': r,
+                })
+            )(state1, theta1, c1_actor, c1_value, rng1)
+            actions = jp.stack([out0['action'], out1['action']], axis=1)
+            logp = jp.stack([out0['logp'], out1['logp']], axis=1)
+            obs_before = obs
+            coin_pos_before = env.coin_pos
+            coin_owner_before = env.coin_owner
+            player1_pos_before = env.players_pos[:, 0]
+            player2_pos_before = env.players_pos[:, 1]
 
-            env, obs, rewards = env.step(actions)
-            rewards = rewards.astype(previous_rewards.dtype)
-            episode['obs'] = episode['obs'].at[t + 1].set(obs)
-            episode['coin_pos'] = episode['coin_pos'].at[t + 1].set(env.coin_pos)
-            episode['coin_owner'] = episode['coin_owner'].at[t + 1].set(env.coin_owner)
-            episode['player1_pos'] = episode['player1_pos'].at[t + 1].set(env.players_pos[0])
-            episode['player2_pos'] = episode['player2_pos'].at[t + 1].set(env.players_pos[1])
-            episode['mfos_state'] = episode['mfos_state'].at[t, 0].set(state0)
-            episode['mfos_state'] = episode['mfos_state'].at[t, 1].set(state1)
-            episode['act'] = episode['act'].at[t].set(actions)
-            episode['logp'] = episode['logp'].at[t].set(logp)
-            episode['rew'] = episode['rew'].at[t].set(rewards)
-            states = jp.stack([state0, state1], axis=0)
+            next_players_pos = (
+                env.players_pos + MOVES[actions]
+            ) % jp.array([height, width], dtype=env.players_pos.dtype)
+            takers = (next_players_pos == env.coin_pos[:, None, :]).all(axis=-1)
+            coin_owner = env.coin_owner
+            same_pickup = takers & (coin_owner[:, None] == jp.arange(2)[None, :])
+            different_pickup = takers & (coin_owner[:, None] != jp.arange(2)[None, :])
+
+            env, obs, rewards = jax.vmap(lambda e, a: e.step(a))(env, actions)
+            rewards = rewards.astype(state_dtype)
+            step_data = {
+                'obs_before': obs_before,
+                'coin_pos_before': coin_pos_before,
+                'coin_owner_before': coin_owner_before,
+                'player1_pos_before': player1_pos_before,
+                'player2_pos_before': player2_pos_before,
+                'mfos_state': jp.stack([state0, state1], axis=1),
+                'act': actions,
+                'logp': logp,
+                'rew': rewards,
+                'same_pickup': same_pickup.astype(state_dtype),
+                'different_pickup': different_pickup.astype(state_dtype),
+            }
             return (
                 env,
+                obs,
                 rng,
-                episode,
-                t + 1,
                 rewards,
                 out0['carry_actor'],
                 out0['carry_value'],
                 out1['carry_actor'],
                 out1['carry_value'],
-            ), states
+            ), step_data
 
-        init = (
-            env,
-            rng,
-            episode,
-            global_t,
-            previous_rewards,
-            carries0['carry_actor'],
-            carries0['carry_value'],
-            carries1['carry_actor'],
-            carries1['carry_value'],
-        )
-        (env, rng, episode, global_t, previous_rewards, _, _, _, _), chunk_states = jax.lax.scan(
-            body_fn,
+        init = (env, obs, play_rng, previous_rewards, c0_actor, c0_value, c1_actor, c1_value)
+        (_, _, rng, _, _, _, _, _), chunk = jax.lax.scan(
+            step_fn,
             init,
             xs=(),
             length=inner_episode_length,
         )
-        theta0_next = agent.theta_from_seq({
-            'state_seq': chunk_states[:, 0].reshape(inner_episode_length, -1),
+        chunk = jax.tree_map(lambda x: jp.swapaxes(x, 0, 1), chunk)
+        theta0_next = agent0.theta_from_batch_seq({
+            'state_seq': chunk['mfos_state'][:, :, 0].reshape(batch_size, inner_episode_length, -1),
         })
-        theta1_next = agent.theta_from_seq({
-            'state_seq': chunk_states[:, 1].reshape(inner_episode_length, -1),
+        theta1_next = agent1.theta_from_batch_seq({
+            'state_seq': chunk['mfos_state'][:, :, 1].reshape(batch_size, inner_episode_length, -1),
         })
-        return (
-            env,
-            rng,
-            episode,
-            global_t,
-            previous_rewards,
-            theta0_next,
-            theta1_next,
-        ), jp.stack([theta0_next, theta1_next])
+        theta_metrics = jp.stack([theta0_next, theta1_next], axis=1)
+        return (rng, theta0_next, theta1_next), {'chunk': chunk, 'theta': theta_metrics}
 
-    init = (
-        env,
-        rng,
-        episode,
-        0,
-        previous_rewards,
-        theta_init,
-        theta_init,
-    )
-    num_inner_episodes = metric_episode_length // inner_episode_length
-    (env, _, episode, _, _, _, _), theta_metrics = jax.lax.scan(
-        scan_inner_episode,
-        init,
+    (_, _, _), outs = jax.lax.scan(
+        run_inner_episode,
+        (rng, theta0_init, theta1_init),
         xs=(),
         length=num_inner_episodes,
     )
-    episode['games'] = jax.tree_map(lambda x, o: x.at[metric_episode_length].set(o), episode['games'], env)
-    return episode, theta_metrics
+    chunks = jax.tree_map(lambda x: jp.swapaxes(x, 0, 1), outs['chunk'])
+    theta_metrics = jp.swapaxes(outs['theta'], 0, 1)
 
+    def flatten_time(x):
+        return x.reshape(batch_size, num_inner_episodes * inner_episode_length, *x.shape[3:])
 
-@partial(jax.jit, static_argnames=('hp', 'mfos_input_shape'))
-def generate_mfos_episodes(agent, rng, hp, mfos_input_shape):
-    batch_size = hp['batch_size']
-    rngs = rax.split(rscope(rng, 'mfos_metric_batch'), batch_size)
-    metric_episode_length = hp['game']['game_length']
-    inner_episode_length = get_mfos_inner_episode_length(hp)
-
-    def generate_one(metric_rng):
-        game_rng, play_rng = rax.split(metric_rng)
-        env, _ = CoinGame.init(
-            rng=game_rng,
-            **coin_game_params(hp),
-        )
-        return play_mfos_metric_episode(
-            agent,
-            play_rng,
-            env,
-            metric_episode_length,
-            inner_episode_length,
-            hp['game']['height'],
-            hp['game']['width'],
-            mfos_input_shape,
-        )
-
-    episodes, theta_metrics = jax.vmap(generate_one)(rngs)
+    flat = jax.tree_map(flatten_time, chunks)
+    obs = jp.concatenate(
+        [
+            flat['obs_before'],
+            flat['obs_before'][:, -1:, :],
+        ],
+        axis=1,
+    )
+    coin_pos = jp.concatenate([flat['coin_pos_before'], flat['coin_pos_before'][:, -1:]], axis=1)
+    coin_owner = jp.concatenate([flat['coin_owner_before'], flat['coin_owner_before'][:, -1:]], axis=1)[..., None]
+    player1_pos = jp.concatenate([flat['player1_pos_before'], flat['player1_pos_before'][:, -1:]], axis=1)
+    player2_pos = jp.concatenate([flat['player2_pos_before'], flat['player2_pos_before'][:, -1:]], axis=1)
+    episodes = {
+        'obs': obs,
+        'act': flat['act'],
+        'rew': flat['rew'],
+        'coin_pos': coin_pos,
+        'coin_owner': coin_owner,
+        'player1_pos': player1_pos,
+        'player2_pos': player2_pos,
+        'logp': flat['logp'],
+        'mfos_state': flat['mfos_state'],
+        'same_pickup': flat['same_pickup'],
+        'different_pickup': flat['different_pickup'],
+    }
     return episodes, theta_metrics
 
 
-@partial(jax.jit, static_argnames=('inner_episode_length',))
-def build_policy_data(episodes, gamma, inner_episode_length):
+def mfos_discounted_returns(rewards, gamma, inner_episode_length):
+    batch_size, num_inner_episodes, inner_steps = rewards.shape
+    flat_rewards = rewards.reshape(batch_size, num_inner_episodes * inner_steps)
+    rewards_time_major = flat_rewards.T
+
+    def body(carry, xs):
+        discounted_reward, global_discounted = carry
+        idx, reward_t = xs
+        discounted_reward = jp.where(
+            (idx != 0) & (idx % inner_episode_length == 0),
+            jp.ones_like(discounted_reward) * global_discounted,
+            discounted_reward,
+        )
+        discounted_reward = reward_t + gamma * discounted_reward
+        global_discounted = reward_t.mean() + gamma * global_discounted
+        return (discounted_reward, global_discounted), discounted_reward
+
+    (_, _), returns_reversed = jax.lax.scan(
+        body,
+        (jp.zeros((batch_size,), dtype=rewards.dtype), jp.array(0., dtype=rewards.dtype)),
+        (jp.arange(rewards_time_major.shape[0]), jp.flip(rewards_time_major, axis=0)),
+    )
+    returns = jp.flip(returns_reversed, axis=0).T
+    returns = returns.reshape(batch_size, num_inner_episodes, inner_steps)
+    return (returns - returns.mean()) / (returns.std() + 1e-5)
+
+
+@partial(jax.jit, static_argnames=('inner_episode_length', 'player_id'))
+def build_policy_data(episodes, gamma, inner_episode_length, player_id):
     batch_size, metric_episode_length = episodes['act'].shape[:2]
     num_inner_episodes = metric_episode_length // inner_episode_length
-    state_seq = episodes['mfos_state'].reshape(
+    state_seq = episodes['mfos_state'][:, :, player_id].reshape(
         batch_size,
         num_inner_episodes,
         inner_episode_length,
-        2,
         -1,
     )
-    state_seq = jp.transpose(state_seq, (3, 0, 1, 2, 4))
-    action_seq = episodes['act'].reshape(batch_size, num_inner_episodes, inner_episode_length, 2)
-    action_seq = jp.transpose(action_seq, (3, 0, 1, 2))
+    action_seq = episodes['act'][:, :, player_id].reshape(batch_size, num_inner_episodes, inner_episode_length)
     taken_logps = jp.take_along_axis(episodes['logp'], episodes['act'][..., None], axis=-1)[..., 0]
-    old_logp_seq = taken_logps.reshape(batch_size, num_inner_episodes, inner_episode_length, 2)
-    old_logp_seq = jp.transpose(old_logp_seq, (3, 0, 1, 2))
-    rewards = episodes['rew'].reshape(batch_size, num_inner_episodes, inner_episode_length, 2)
-    rewards = jp.transpose(rewards, (3, 0, 1, 2))
-    returns = discounted_returns_flat(rewards.reshape(2 * batch_size, metric_episode_length), gamma)
-    returns = returns.reshape(2, batch_size, num_inner_episodes, inner_episode_length)
-    returns = (returns - returns.mean()) / (returns.std() + 1e-5)
+    old_logp_seq = taken_logps[:, :, player_id].reshape(batch_size, num_inner_episodes, inner_episode_length)
+    rewards = episodes['rew'][:, :, player_id].reshape(batch_size, num_inner_episodes, inner_episode_length)
+    returns = mfos_discounted_returns(rewards, gamma, inner_episode_length)
     return {
         'state_seq': state_seq,
         'action_seq': action_seq,
@@ -332,12 +316,12 @@ def make_update_mfos_policy_fn(
         clip_grad_norm,
         inner_episode_length,
 ):
-    @jax.jit
-    def update(agent, opt_state, episodes):
-        data = build_policy_data(episodes, gamma, inner_episode_length)
+    @partial(jax.jit, static_argnames=('player_id',))
+    def update(agent, opt_state, episodes, player_id):
+        data = build_policy_data(episodes, gamma, inner_episode_length, player_id)
 
         def loss_fn(a):
-            outputs = a.evaluate_batched_meta_sequences({'state_seq': data['state_seq']})
+            outputs = a.evaluate_agent_sequences({'state_seq': data['state_seq']})
             logp_seq = outputs['logp_seq']
             value_seq = outputs['value_seq']
             new_logp_seq = jp.take_along_axis(
@@ -401,6 +385,75 @@ def compute_mfos_diagnostics(episodes, theta_metrics):
     }
 
 
+def compute_mfos_iteration_metric_row(
+        episode_batches,
+        iteration,
+        episode,
+        timestep,
+        window_start_iteration,
+        window_start_episode,
+        window_start_timestep,
+):
+    rewards = np.concatenate([np.asarray(jax.device_get(batch['rew'])) for batch in episode_batches], axis=0)
+    same_pickup = np.concatenate(
+        [np.asarray(jax.device_get(batch['same_pickup'])) for batch in episode_batches],
+        axis=0,
+    )
+    different_pickup = np.concatenate(
+        [np.asarray(jax.device_get(batch['different_pickup'])) for batch in episode_batches],
+        axis=0,
+    )
+    actions = np.concatenate([np.asarray(jax.device_get(batch['act'])) for batch in episode_batches], axis=0)
+    num_episodes, game_length, _ = rewards.shape
+    pickups = same_pickup + different_pickup
+    any_pickup = pickups > 0
+
+    row = {
+        'iteration': iteration,
+        'episode': episode,
+        'timestep': timestep,
+        'window_start_iteration': window_start_iteration,
+        'window_start_episode': window_start_episode,
+        'window_start_timestep': window_start_timestep,
+        'num_iterations_in_window': iteration - window_start_iteration + 1,
+        'num_episodes_in_window': num_episodes,
+        'num_timesteps_in_window': num_episodes * game_length,
+        'game_length': game_length,
+    }
+
+    for player in (0, 1):
+        player_rewards = rewards[:, :, player]
+        same = same_pickup[:, :, player].sum(axis=1)
+        different = different_pickup[:, :, player].sum(axis=1)
+        total_pickups = same + different
+        row[f'mean_reward_player{player}'] = float(player_rewards.mean(axis=1).mean())
+        row[f'avg_episode_return_player{player}'] = float(player_rewards.sum(axis=1).mean())
+        row[f'avg_pickups_player{player}'] = float(total_pickups.mean())
+        row[f'avg_same_color_pickups_player{player}'] = float(same.mean())
+        row[f'avg_different_color_pickups_player{player}'] = float(different.mean())
+        row[f'same_color_pickup_ratio_player{player}'] = float(same.sum() / max(total_pickups.sum(), 1e-8))
+        row[f'mean_rewards_{player}'] = row[f'mean_reward_player{player}']
+        row[f'mean_pickup_rewards_{player}'] = float(
+            (player_rewards * any_pickup[:, :, player]).sum() / max(any_pickup[:, :, player].sum(), 1e-8)
+        )
+        action_counts = np.bincount(actions[:, :, player].reshape(-1), minlength=4).astype(np.float64)
+        marginal = action_counts / max(action_counts.sum(), 1.0)
+        row[f'action_entropy_{player}'] = float(-(marginal * np.log(marginal + 1e-8)).sum())
+        row[f'easymisses_{player}'] = 0.0
+        row[f'adversity_{player}'] = float(different_pickup[:, :, player].sum() / max(pickups[:, :, player].sum(), 1e-8))
+        row[f'adversarial_pickup_div_timesteps_{player}'] = float(different_pickup[:, :, player].sum() / (num_episodes * game_length))
+        row[f'any_pickup_div_timesteps_{player}'] = float(pickups[:, :, player].sum() / (num_episodes * game_length))
+        row[f'adversarial_pickup_div_all_pickup_{player}'] = row[f'adversity_{player}']
+        row[f'own_pickup_div_timesteps_{player}'] = float(same_pickup[:, :, player].sum() / (num_episodes * game_length))
+        row[f'nearpasses_{player}'] = 0.0
+
+    row['collective_return'] = float(
+        row['avg_episode_return_player0'] + row['avg_episode_return_player1']
+    ) / 2
+    row['reward_difference'] = float(abs(row['avg_episode_return_player0'] - row['avg_episode_return_player1']))
+    return row
+
+
 def set_up_state_from_config(hp):
     dummy_env, _ = CoinGame.init(
         rng=rax.PRNGKey(hp['seed']),
@@ -411,7 +464,6 @@ def set_up_state_from_config(hp):
     num_inner_episodes = hp['game']['game_length'] // inner_episode_length
     dummy_state_seq = jp.zeros(
         (
-            2,
             hp['batch_size'],
             num_inner_episodes,
             inner_episode_length,
@@ -419,7 +471,7 @@ def set_up_state_from_config(hp):
         ),
         dtype=jp.float32,
     )
-    rng, agent_rng = rax.split(rax.PRNGKey(hp['seed']), 2)
+    rng, agent0_rng, agent1_rng = rax.split(rax.PRNGKey(hp['seed']), 3)
 
     mfos_hp = hp['mfos']
     agent_module = MFOSCoinAgent(
@@ -429,10 +481,13 @@ def set_up_state_from_config(hp):
         out_channels=int(mfos_hp['out_channels']),
         layers_before_gru=int(mfos_hp['layers_before_gru']),
     )
-    agent_params = agent_module.init(agent_rng, {'state_seq': dummy_state_seq, 'rng': rax.PRNGKey(0)})
-    agent = CoinAgent(params=agent_params, model=agent_module, player=0)
+    agent0_params = agent_module.init(agent0_rng, {'state_seq': dummy_state_seq, 'rng': rax.PRNGKey(0)})
+    agent1_params = agent_module.init(agent1_rng, {'state_seq': dummy_state_seq, 'rng': rax.PRNGKey(1)})
+    agent0 = CoinAgent(params=agent0_params, model=agent_module, player=0)
+    agent1 = CoinAgent(params=agent1_params, model=agent_module, player=1)
     optimizer = optax.adam(float(mfos_hp['lr']))
-    agent_opt = Optimizer(optimizer, optimizer.init(agent))
+    agent0_opt = Optimizer(optimizer, optimizer.init(agent0))
+    agent1_opt = Optimizer(optimizer, optimizer.init(agent1))
     update_policy = make_update_mfos_policy_fn(
         optimizer,
         float(hp['reward_discount']),
@@ -444,8 +499,10 @@ def set_up_state_from_config(hp):
     )
     return {
         'rng': rng,
-        'agent': agent,
-        'agent_opt': agent_opt,
+        'agent0': agent0,
+        'agent1': agent1,
+        'agent0_opt': agent0_opt,
+        'agent1_opt': agent1_opt,
         'update_policy': update_policy,
         'mfos_input_shape': tuple(mfos_input_shape),
     }
@@ -510,12 +567,6 @@ def train(hp, log_wandb):
     iteration_metrics_csv_path = init_mfos_metrics_csv(save_path, hp)
     print(f'metrics csv path: {iteration_metrics_csv_path}')
 
-    dummy_env, _ = CoinGame.init(
-        rng=rax.PRNGKey(hp['seed']),
-        **coin_game_params(hp),
-    )
-    episode_stats_jitted = jax.jit(lambda es: episode_stats(es, dummy_env))
-
     metric_window_batches = []
     metric_window_update_rows = []
     window_start_iteration = 0
@@ -528,21 +579,34 @@ def train(hp, log_wandb):
     for i in range(num_training_iterations):
         state['rng'], rng = rax.split(state['rng'])
         episodes, theta_metrics = generate_mfos_episodes(
-            state['agent'],
+            state['agent0'],
+            state['agent1'],
             rng,
             hp,
             state['mfos_input_shape'],
         )
         metric_window_batches.append(episodes)
 
-        new_agent, new_opt_state, update_metrics = state['update_policy'](
-            state['agent'],
-            state['agent_opt'].opt_state,
+        new_agent0, new_opt0_state, update0_metrics = state['update_policy'](
+            state['agent0'],
+            state['agent0_opt'].opt_state,
             episodes,
+            0,
         )
-        state['agent'] = new_agent
-        state['agent_opt'] = state['agent_opt'].replace(opt_state=new_opt_state)
-        update_metric_row = {key: scalar_mean(value) for key, value in update_metrics.items()}
+        new_agent1, new_opt1_state, update1_metrics = state['update_policy'](
+            state['agent1'],
+            state['agent1_opt'].opt_state,
+            episodes,
+            1,
+        )
+        state['agent0'] = new_agent0
+        state['agent1'] = new_agent1
+        state['agent0_opt'] = state['agent0_opt'].replace(opt_state=new_opt0_state)
+        state['agent1_opt'] = state['agent1_opt'].replace(opt_state=new_opt1_state)
+        update_metric_row = {
+            key: float(np.mean([scalar_mean(update0_metrics[key]), scalar_mean(update1_metrics[key])]))
+            for key in update0_metrics
+        }
         diagnostics = compute_mfos_diagnostics(episodes, theta_metrics)
         update_metric_row.update({key: scalar_mean(value) for key, value in diagnostics.items()})
 
@@ -556,9 +620,7 @@ def train(hp, log_wandb):
             or i == num_training_iterations - 1
         )
         if should_log_metrics:
-            metric_window_episodes = tree_concatenate(metric_window_batches)
-            metric_window_stats = episode_stats_jitted(metric_window_episodes)
-            metric_row = compute_iteration_metric_row(
+            metric_row = compute_mfos_iteration_metric_row(
                 episode_batches=metric_window_batches,
                 iteration=i,
                 episode=completed_episodes,
@@ -566,7 +628,6 @@ def train(hp, log_wandb):
                 window_start_iteration=window_start_iteration,
                 window_start_episode=window_start_episode,
                 window_start_timestep=window_start_timestep,
-                statistics=metric_window_stats,
             )
             for key in MFOS_METRIC_FIELDNAMES + ['walltime']:
                 values = [row[key] for row in metric_window_update_rows if key in row]
@@ -591,12 +652,33 @@ def train(hp, log_wandb):
                 for key, value in update_metric_row.items()
                 if isinstance(value, float)
             })
-            stats = episode_stats_jitted(episodes)
-            print(stats)
+            print({
+                key: round(value, 4)
+                for key, value in compute_mfos_iteration_metric_row(
+                    [episodes],
+                    i,
+                    completed_episodes,
+                    completed_timesteps,
+                    i,
+                    completed_episodes - episodes_per_iteration,
+                    completed_timesteps - timesteps_per_iteration,
+                ).items()
+                if key in (
+                    'avg_same_color_pickups_player0',
+                    'avg_same_color_pickups_player1',
+                    'avg_different_color_pickups_player0',
+                    'avg_different_color_pickups_player1',
+                    'same_color_pickup_ratio_player0',
+                    'same_color_pickup_ratio_player1',
+                    'collective_return',
+                    'reward_difference',
+                )
+            })
 
         if i % hp['save_every'] == 0:
             minimal_state = {
-                'agent': npify(state['agent']),
+                'agent0': npify(state['agent0']),
+                'agent1': npify(state['agent1']),
                 'hp': hp,
             }
             with open(os.path.join(save_path, f'minimal_state_{i}'), 'wb') as f:

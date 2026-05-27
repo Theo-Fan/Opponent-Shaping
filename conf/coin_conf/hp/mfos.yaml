@@ -5,6 +5,7 @@ agent_0: 'mfos'
 agent_1: 'mfos'
 batch_size: 20
 just_self_play: True
+reward_discount: 0.995
 max_train_timestep: 30000000
 metrics_log_timestep_freq: 4000
 
@@ -13,8 +14,8 @@ mfos:
   out_channels: 16
   layers_before_gru: 1
   inner_episode_length: 20
-  lr: 0.005
-  ppo_epochs: 5
-  eps_clip: 0.15
-  entropy_weight: 0.01
+  lr: 0.0002
+  ppo_epochs: 16
+  eps_clip: 0.2
+  entropy_weight: 0.0
   clip_grad_norm: 1.0
