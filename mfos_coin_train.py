@@ -42,9 +42,6 @@ MFOS_METRIC_FIELDNAMES = [
     'loss_mfos_value',
     'mfos_entropy',
     'grad_mfos_norm',
-    'did_mfos_update',
-    'num_metric_iterations_per_update',
-    'num_timesteps_per_update',
     'theta_mean',
     'theta_std',
     'action_frequency_left_player0',
@@ -90,34 +87,6 @@ def make_mfos_state(obs, own_previous_reward, other_previous_reward, done, heigh
 
 def get_mfos_inner_episode_length(hp):
     return int(hp['mfos'].get('inner_episode_length', hp['game']['game_length']))
-
-
-def get_mfos_update_interval_iterations(hp):
-    return int(hp['mfos'].get('update_interval_iterations', 1))
-
-
-def concatenate_episode_batches(episode_batches):
-    if len(episode_batches) == 1:
-        return episode_batches[0]
-    return jax.tree_util.tree_map(lambda *xs: jp.concatenate(xs, axis=0), *episode_batches)
-
-
-def make_mfos_learning_rate(hp):
-    mfos_hp = hp['mfos']
-    initial_lr = float(mfos_hp['lr'])
-    final_lr = float(mfos_hp.get('lr_final', initial_lr))
-    if final_lr == initial_lr:
-        return initial_lr
-
-    num_policy_updates = int(np.ceil(get_num_training_iterations(hp) / get_mfos_update_interval_iterations(hp)))
-    num_optimizer_steps = max(1, num_policy_updates * int(mfos_hp['ppo_epochs']))
-    decay_fraction = float(mfos_hp.get('lr_decay_fraction', 1.0))
-    transition_steps = max(1, int(num_optimizer_steps * decay_fraction))
-    return optax.linear_schedule(
-        init_value=initial_lr,
-        end_value=final_lr,
-        transition_steps=transition_steps,
-    )
 
 
 def batch_initial_carry(carry, batch_size):
@@ -516,7 +485,7 @@ def set_up_state_from_config(hp):
     agent1_params = agent_module.init(agent1_rng, {'state_seq': dummy_state_seq, 'rng': rax.PRNGKey(1)})
     agent0 = CoinAgent(params=agent0_params, model=agent_module, player=0)
     agent1 = CoinAgent(params=agent1_params, model=agent_module, player=1)
-    optimizer = optax.adam(make_mfos_learning_rate(hp))
+    optimizer = optax.adam(float(mfos_hp['lr']))
     agent0_opt = Optimizer(optimizer, optimizer.init(agent0))
     agent1_opt = Optimizer(optimizer, optimizer.init(agent1))
     update_policy = make_update_mfos_policy_fn(
@@ -556,8 +525,6 @@ def validate_mfos_config(hp):
             'hp.mfos.inner_episode_length must divide hp.game.game_length so every metric episode has '
             'a fixed 200-step window.'
         )
-    if get_mfos_update_interval_iterations(hp) <= 0:
-        raise ValueError('hp.mfos.update_interval_iterations must be positive.')
 
 
 def train(hp, log_wandb):
@@ -577,7 +544,6 @@ def train(hp, log_wandb):
     metrics_log_timestep_freq = get_metrics_log_timestep_freq(hp)
     inner_episode_length = get_mfos_inner_episode_length(hp)
     inner_episodes_per_metric_episode = episode_length // inner_episode_length
-    update_interval_iterations = get_mfos_update_interval_iterations(hp)
     expected_metric_rows = int(np.ceil(total_training_timesteps / metrics_log_timestep_freq))
     state = set_up_state_from_config(hp)
 
@@ -597,17 +563,12 @@ def train(hp, log_wandb):
     print(f'total training timesteps: {total_training_timesteps}')
     print(f'metrics log timestep frequency: {metrics_log_timestep_freq}')
     print(f'expected CSV/W&B rows: {expected_metric_rows}')
-    print(
-        f'mfos PPO update interval: {update_interval_iterations} metric iterations '
-        f'({update_interval_iterations * timesteps_per_iteration} timesteps/update)'
-    )
 
     iteration_metrics_csv_path = init_mfos_metrics_csv(save_path, hp)
     print(f'metrics csv path: {iteration_metrics_csv_path}')
 
     metric_window_batches = []
     metric_window_update_rows = []
-    ppo_update_batches = []
     window_start_iteration = 0
     window_start_episode = 0
     window_start_timestep = 0
@@ -625,46 +586,29 @@ def train(hp, log_wandb):
             state['mfos_input_shape'],
         )
         metric_window_batches.append(episodes)
-        ppo_update_batches.append(episodes)
 
-        diagnostics = compute_mfos_diagnostics(episodes, theta_metrics)
-        update_metric_row = {key: scalar_mean(value) for key, value in diagnostics.items()}
-
-        should_update_policy = (
-            len(ppo_update_batches) >= update_interval_iterations
-            or i == num_training_iterations - 1
+        new_agent0, new_opt0_state, update0_metrics = state['update_policy'](
+            state['agent0'],
+            state['agent0_opt'].opt_state,
+            episodes,
+            0,
         )
-        if should_update_policy:
-            num_update_iterations = len(ppo_update_batches)
-            update_episodes = concatenate_episode_batches(ppo_update_batches)
-            new_agent0, new_opt0_state, update0_metrics = state['update_policy'](
-                state['agent0'],
-                state['agent0_opt'].opt_state,
-                update_episodes,
-                0,
-            )
-            new_agent1, new_opt1_state, update1_metrics = state['update_policy'](
-                state['agent1'],
-                state['agent1_opt'].opt_state,
-                update_episodes,
-                1,
-            )
-            state['agent0'] = new_agent0
-            state['agent1'] = new_agent1
-            state['agent0_opt'] = state['agent0_opt'].replace(opt_state=new_opt0_state)
-            state['agent1_opt'] = state['agent1_opt'].replace(opt_state=new_opt1_state)
-            update_metric_row.update({
-                key: float(np.mean([scalar_mean(update0_metrics[key]), scalar_mean(update1_metrics[key])]))
-                for key in update0_metrics
-            })
-            update_metric_row['did_mfos_update'] = 1.0
-            update_metric_row['num_metric_iterations_per_update'] = float(num_update_iterations)
-            update_metric_row['num_timesteps_per_update'] = float(num_update_iterations * timesteps_per_iteration)
-            ppo_update_batches = []
-        else:
-            update_metric_row['did_mfos_update'] = 0.0
-            update_metric_row['num_metric_iterations_per_update'] = 0.0
-            update_metric_row['num_timesteps_per_update'] = 0.0
+        new_agent1, new_opt1_state, update1_metrics = state['update_policy'](
+            state['agent1'],
+            state['agent1_opt'].opt_state,
+            episodes,
+            1,
+        )
+        state['agent0'] = new_agent0
+        state['agent1'] = new_agent1
+        state['agent0_opt'] = state['agent0_opt'].replace(opt_state=new_opt0_state)
+        state['agent1_opt'] = state['agent1_opt'].replace(opt_state=new_opt1_state)
+        update_metric_row = {
+            key: float(np.mean([scalar_mean(update0_metrics[key]), scalar_mean(update1_metrics[key])]))
+            for key in update0_metrics
+        }
+        diagnostics = compute_mfos_diagnostics(episodes, theta_metrics)
+        update_metric_row.update({key: scalar_mean(value) for key, value in diagnostics.items()})
 
         completed_episodes += episodes_per_iteration
         completed_timesteps += timesteps_per_iteration

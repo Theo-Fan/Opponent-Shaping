@@ -14,11 +14,8 @@ mfos:
   out_channels: 16
   layers_before_gru: 1
   inner_episode_length: 20
-  update_interval_iterations: 1
-  lr: 0.0005
-  lr_final: 0.0001
-  lr_decay_fraction: 1.0
-  ppo_epochs: 8
-  eps_clip: 0.15
-  entropy_weight: 0.001
-  clip_grad_norm: 0.5
+  lr: 0.001
+  ppo_epochs: 16
+  eps_clip: 0.2
+  entropy_weight: 0.0
+  clip_grad_norm: 1.0
