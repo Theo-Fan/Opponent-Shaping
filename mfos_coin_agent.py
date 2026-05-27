@@ -46,9 +46,12 @@ class MFOSCoinAgent(nn.Module):
     def __call__(self, x):
         state_seq = x['state_seq']
         rng = x['rng']
-        self.evaluate_meta_sequences({'state_seq': state_seq})
+        if state_seq.ndim == 4:
+            self.evaluate_meta_sequences({'state_seq': state_seq})
+        else:
+            self.evaluate_batched_meta_sequences({'state_seq': state_seq})
         self.call_step({
-            'state': state_seq[0, 0, 0],
+            'state': state_seq.reshape(-1, state_seq.shape[-1])[0],
             'theta': self.get_initial_theta(),
             'carry_actor': self.actor_head.get_initial_carry(),
             'carry_value': self.value_head.get_initial_carry(),
@@ -127,4 +130,64 @@ class MFOSCoinAgent(nn.Module):
 
         logp_seq = nn.log_softmax(logits, axis=-1).reshape(num_players, outer_steps, inner_steps, self.num_actions)
         value_seq = values.reshape(num_players, outer_steps, inner_steps)
+        return {'logp_seq': logp_seq, 'value_seq': value_seq, 'theta_seq': theta}
+
+    def evaluate_batched_meta_sequences(self, x):
+        state_seq = x['state_seq']
+        num_players, batch_size, outer_steps, inner_steps, state_dim = state_seq.shape
+
+        def theta_for_one_outer(seq):
+            return self.theta_from_seq({'state_seq': seq})
+
+        theta_current = jax.vmap(
+            jax.vmap(
+                jax.vmap(theta_for_one_outer, in_axes=0),
+                in_axes=0,
+            ),
+            in_axes=0,
+        )(state_seq)
+        theta0 = jp.ones((num_players, batch_size, 1, self.hidden_size), dtype=state_seq.dtype)
+        theta = jp.concatenate([theta0, theta_current[:, :, :-1]], axis=2)
+
+        flat_state = state_seq.reshape(num_players * batch_size * outer_steps * inner_steps, state_dim)
+        actor_features = jax.vmap(self.actor_encoder)(flat_state)
+        value_features = jax.vmap(self.value_encoder)(flat_state)
+        actor_features = actor_features.reshape(
+            num_players, batch_size, outer_steps, inner_steps, self.hidden_size
+        )
+        value_features = value_features.reshape(
+            num_players, batch_size, outer_steps, inner_steps, self.hidden_size
+        )
+
+        def run_actor(seq):
+            return self.actor_head(seq, carry=None)['hs']
+
+        def run_value(seq):
+            return self.value_head(seq, carry=None)['hs']
+
+        actor_hidden = jax.vmap(
+            jax.vmap(jax.vmap(run_actor, in_axes=0), in_axes=0),
+            in_axes=0,
+        )(actor_features)
+        value_hidden = jax.vmap(
+            jax.vmap(jax.vmap(run_value, in_axes=0), in_axes=0),
+            in_axes=0,
+        )(value_features)
+
+        actor_hidden = nn.relu(actor_hidden) * theta[:, :, :, None, :]
+        value_hidden = nn.relu(value_hidden) * jax.lax.stop_gradient(theta[:, :, :, None, :])
+
+        flat_actor_hidden = actor_hidden.reshape(
+            num_players * batch_size * outer_steps * inner_steps, self.hidden_size
+        )
+        flat_value_hidden = value_hidden.reshape(
+            num_players * batch_size * outer_steps * inner_steps, self.hidden_size
+        )
+        logits = jax.vmap(self.actor_logits)(flat_actor_hidden)
+        values = jax.vmap(self.value_out)(flat_value_hidden)[..., 0]
+
+        logp_seq = nn.log_softmax(logits, axis=-1).reshape(
+            num_players, batch_size, outer_steps, inner_steps, self.num_actions
+        )
+        value_seq = values.reshape(num_players, batch_size, outer_steps, inner_steps)
         return {'logp_seq': logp_seq, 'value_seq': value_seq, 'theta_seq': theta}
