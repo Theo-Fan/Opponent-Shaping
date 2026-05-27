@@ -1,0 +1,19 @@
+defaults:
+  - _self_
+
+agent_0: 'mfos'
+agent_1: 'mfos'
+batch_size: 20
+just_self_play: True
+max_train_timestep: 30000000
+metrics_log_timestep_freq: 4000
+
+mfos:
+  hidden_size: 16
+  out_channels: 16
+  layers_before_gru: 1
+  lr: 0.005
+  ppo_epochs: 5
+  eps_clip: 0.15
+  entropy_weight: 0.01
+  clip_grad_norm: 1.0

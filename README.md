@@ -97,6 +97,32 @@ done
 Reciprocator CSVs are saved as `experiments/<run_id>/selfplay_RECIPROCATOR_seed<seed>.csv`.
 The CSV also logs Reciprocator diagnostics such as reciprocal-reward std/mean-absolute value, shaped returns, pickup correlations, and per-action frequencies.
 
+## JAX MFOS Self-Play on the Same Coin Game
+
+The JAX MFOS entry point uses the same 3x3 Coin Game, 200-step episodes, 20 episodes per CSV/W&B row, 4000 timesteps per row, and 3e7 total environment timesteps. Internally those 20 episodes are sampled sequentially as MFOS meta-game steps so the trajectory encoder can condition each episode on the previous one.
+
+Run one seed:
+```bash
+conda activate socialjax
+cd LOQA/
+python mfos_coin_train.py hp=mfos wandb.state=enabled "wandb.tags=[coin,mfos_3x3]"
+```
+
+Run a short smoke test without W&B:
+```bash
+python mfos_coin_train.py hp=mfos wandb.state=disabled hp.max_train_timestep=4000 hp.save_every=999999 hp.eval_every=999999
+```
+
+Run five seeds:
+```bash
+cd LOQA/
+for seed in 21 22 23 24 25; do
+  python mfos_coin_train.py hp=mfos hp.seed=$seed wandb.state=enabled "wandb.tags=[coin,mfos_3x3,seed${seed}]"
+done
+```
+
+MFOS CSVs are saved as `experiments/<run_id>/selfplay_MFOS_seed<seed>.csv`.
+The CSV also logs MFOS diagnostics such as PPO loss, entropy, gradient norm, theta mean/std, and per-action frequencies.
 
 
 
