@@ -1243,14 +1243,8 @@ def main(cfg: DictConfig) -> None:
         wandb.config.update(hp)
         wandb.run.log_code(".", include_fn=lambda path: path.endswith(".py"))
 
-        # go recursively to ./conf and its subdirectories and save every file with yaml
-        for root, dirs, files in os.walk('conf'):
-            for file in files:
-                if file.endswith('.yaml'):
-                    wandb.save(os.path.join(root, file))
-        # zip the conf folder and save that too
         shutil.make_archive('conf', 'zip', 'conf')
-        wandb.save('conf.zip')
+        wandb.save('conf.zip', policy='now')
         wandb.run.summary.update(slurm_infos())
 
     train(hp, log_wandb)

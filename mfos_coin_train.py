@@ -23,6 +23,7 @@ from coin_train import (
     Optimizer,
     TRAIN_ITERATION_METRICS_FIELDNAMES,
     compute_iteration_metric_row,
+    format_wandb_metrics,
     get_metrics_csv_filename,
     get_metrics_log_timestep_freq,
     get_num_training_episodes_per_iteration,
@@ -574,7 +575,7 @@ def train(hp, log_wandb):
 
             append_mfos_metric_row(iteration_metrics_csv_path, metric_row)
             if log_wandb:
-                wandb.log(metric_row, step=completed_timesteps)
+                wandb.log(format_wandb_metrics(metric_row), step=completed_timesteps)
 
             metric_window_batches = []
             metric_window_update_rows = []
@@ -623,12 +624,8 @@ def main(cfg: DictConfig) -> None:
         )
         wandb.config.update(hp)
         wandb.run.log_code('.', include_fn=lambda path: path.endswith('.py'))
-        for root, dirs, files in os.walk('conf'):
-            for file in files:
-                if file.endswith('.yaml'):
-                    wandb.save(os.path.join(root, file))
         shutil.make_archive('conf', 'zip', 'conf')
-        wandb.save('conf.zip')
+        wandb.save('conf.zip', policy='now')
         wandb.run.summary.update(slurm_infos())
 
     train(hp, log_wandb)

@@ -123,6 +123,95 @@ TRAIN_ITERATION_METRICS_FIELDNAMES = [
     *EPISODE_STATS_FIELDNAMES,
     *TRAIN_UPDATE_METRICS_FIELDNAMES,
 ]
+GLOBAL_WANDB_KEYS = {
+    'iteration',
+    'episode',
+    'timestep',
+    'window_start_iteration',
+    'window_start_episode',
+    'window_start_timestep',
+    'num_iterations_in_window',
+    'num_episodes_in_window',
+    'num_timesteps_in_window',
+    'game_length',
+    'collective_return',
+    'reward_difference',
+    'walltime',
+}
+
+
+def namespaced_wandb_key(key):
+    player_metric_names = {
+        'mean_reward': 'mean_reward',
+        'avg_episode_return': 'episode_return',
+        'avg_pickups': 'pickups',
+        'avg_same_color_pickups': 'same_color_pickups',
+        'avg_different_color_pickups': 'different_color_pickups',
+        'same_color_pickup_ratio': 'same_color_pickup_ratio',
+    }
+    for player in (0, 1):
+        player_suffix = f'_player{player}'
+        if key.endswith(player_suffix):
+            metric_name = key[:-len(player_suffix)]
+            metric_name = player_metric_names.get(metric_name, metric_name)
+            return f'agent{player}/{metric_name}'
+
+        stats_suffix = f'_{player}'
+        if key.endswith(stats_suffix) and key[:-len(stats_suffix)] in EPISODE_STATS_KEYS:
+            return f'agent{player}/{key[:-len(stats_suffix)]}'
+
+    if key == 'loss_agent_0_qvalue':
+        return 'agent0/loss_qvalue'
+    if key == 'loss_agent_1_qvalue':
+        return 'agent1/loss_qvalue'
+
+    for player in (0, 1):
+        if key == f'agent{player}_entropy':
+            return f'agent{player}/entropy'
+        if key == f'grad_agent{player}_norm':
+            return f'agent{player}/grad_norm'
+        if key == f'grad_opponent{player}_norm':
+            return f'agent{player}/grad_opponent_norm'
+
+    if key == 'mean_voi_0_on_1':
+        return 'interaction/mean_voi_agent0_on_agent1'
+    if key == 'mean_voi_1_on_0':
+        return 'interaction/mean_voi_agent1_on_agent0'
+
+    if key.startswith('loss_mfos_'):
+        return f'mfos/{key.removeprefix("loss_mfos_")}'
+    if key == 'mfos_entropy':
+        return 'mfos/entropy'
+    if key == 'grad_mfos_norm':
+        return 'mfos/grad_norm'
+    if key.startswith('theta_'):
+        return f'mfos/{key}'
+
+    if key.startswith('loss_voi_'):
+        return f'reciprocator/{key.removeprefix("loss_voi_")}'
+    if key.startswith('mean_voi_'):
+        return f'reciprocator/{key}'
+    if key.startswith('loss_ppo_'):
+        return f'train/{key.removeprefix("loss_ppo_")}'
+    if key == 'ppo_entropy':
+        return 'train/ppo_entropy'
+    if key == 'grad_ppo_norm':
+        return 'train/grad_ppo_norm'
+
+    if key in GLOBAL_WANDB_KEYS:
+        return f'global/{key}'
+    return f'global/{key}'
+
+
+def format_wandb_metrics(row):
+    formatted = {namespaced_wandb_key(key): value for key, value in row.items()}
+    if 'mean_reward_player0' in row and 'mean_reward_player1' in row:
+        formatted['global/average_reward'] = float(row['mean_reward_player0'] + row['mean_reward_player1']) / 2
+    if 'avg_episode_return_player0' in row and 'avg_episode_return_player1' in row:
+        formatted['global/average_episode_return'] = (
+            float(row['avg_episode_return_player0'] + row['avg_episode_return_player1']) / 2
+        )
+    return formatted
 
 
 def get_num_training_episodes_per_iteration(hp):
@@ -678,7 +767,7 @@ def train(hp, log_wandb):
 
             append_iteration_metric_row(iteration_metrics_csv_path, metric_row)
             if log_wandb:
-                wandb.log(metric_row, step=completed_timesteps)
+                wandb.log(format_wandb_metrics(metric_row), step=completed_timesteps)
 
             metric_window_batches = []
             metric_window_update_rows = []
@@ -733,7 +822,7 @@ def train(hp, log_wandb):
                         'grad_opponent1_norm': grad_opponent1_norm.mean(), }
                     to_logs = {**to_logs, **dict_for_agent1}
 
-                wandb.log(to_logs, step=completed_timesteps)
+                wandb.log(format_wandb_metrics(to_logs), step=completed_timesteps)
 
                 eval_agent_against_always_cooperate(state, hp, episode_stats_jitted, player=0)
                 eval_agent_against_always_defect(state, hp, episode_stats_jitted, player=0)
@@ -1259,14 +1348,8 @@ def main(cfg: DictConfig) -> None:
         wandb.config.update(hp)
         wandb.run.log_code(".", include_fn=lambda path: path.endswith(".py"))
 
-        # go recursively to ./conf and its subdirectories and save every file with yaml
-        for root, dirs, files in os.walk("conf"):
-            for file in files:
-                if file.endswith('.yaml'):
-                    wandb.save(os.path.join(root, file))
-        # zip the conf folder and save that too
         shutil.make_archive('conf', 'zip', 'conf')
-        wandb.save('conf.zip')
+        wandb.save('conf.zip', policy='now')
         wandb.run.summary.update(slurm_infos())
 
     train(hp, log_wandb)

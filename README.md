@@ -28,7 +28,8 @@ This repository is configured to run LOQA self-play on the modified 3x3 Coin Gam
 - each CSV/W&B row averages 20 episodes, i.e. 4000 environment timesteps;
 - total training lasts 3e7 environment timesteps;
 - metrics are written to `experiments/<run_id>/selfplay_LOQA_seed<seed>.csv`;
-- when W&B is enabled, `<run_id>` is the W&B run id.
+- when W&B is enabled, `<run_id>` is the W&B run id;
+- W&B metrics are grouped with slash prefixes, for example `agent0/same_color_pickups`, `agent1/different_color_pickups`, `agent0/same_color_pickup_ratio`, `agent1/mean_reward`, `global/reward_difference`, and `global/average_reward`.
 
 run:
 ```bash
@@ -123,7 +124,6 @@ done
 
 MFOS CSVs are saved as `experiments/<run_id>/selfplay_MFOS_seed<seed>.csv`.
 The CSV also logs MFOS diagnostics such as PPO loss, entropy, gradient norm, theta mean/std, and per-action frequencies.
-
 
 
 
