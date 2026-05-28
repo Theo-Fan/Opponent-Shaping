@@ -91,6 +91,21 @@ def get_mfos_inner_episode_length(hp):
     return int(hp['mfos'].get('inner_episode_length', hp['game']['game_length']))
 
 
+def get_metric_episodes_per_row(hp):
+    metric_timesteps = get_metrics_log_timestep_freq(hp)
+    episode_length = int(hp['game']['game_length'])
+    if metric_timesteps % episode_length != 0:
+        raise ValueError(
+            f'metrics_log_timestep_freq={metric_timesteps} must be divisible by '
+            f'episode_length={episode_length} when splitting metric rows inside a training batch.'
+        )
+    return metric_timesteps // episode_length
+
+
+def slice_episode_batch(episodes, start, end):
+    return jax.tree_map(lambda x: x[start:end], episodes)
+
+
 def batch_initial_carry(carry, batch_size):
     return jax.tree_map(lambda x: jp.repeat(x[None], batch_size, axis=0), carry)
 
@@ -542,6 +557,14 @@ def validate_mfos_config(hp):
             'hp.mfos.inner_episode_length must divide hp.game.game_length so every metric episode has '
             'a fixed 200-step window.'
         )
+    metric_episodes_per_row = get_metric_episodes_per_row(hp)
+    if metric_episodes_per_row <= 0:
+        raise ValueError('metrics_log_timestep_freq must cover at least one full episode.')
+    if hp['batch_size'] % metric_episodes_per_row != 0:
+        raise ValueError(
+            f'batch_size={hp["batch_size"]} must be divisible by metric_episodes_per_row='
+            f'{metric_episodes_per_row}.'
+        )
 
 
 def train(hp, log_wandb):
@@ -559,6 +582,7 @@ def train(hp, log_wandb):
     episode_length = int(hp['game']['game_length'])
     total_training_timesteps = get_total_training_timesteps(hp)
     metrics_log_timestep_freq = get_metrics_log_timestep_freq(hp)
+    metric_episodes_per_row = get_metric_episodes_per_row(hp)
     inner_episode_length = get_mfos_inner_episode_length(hp)
     inner_episodes_per_metric_episode = episode_length // inner_episode_length
     expected_metric_rows = int(np.ceil(total_training_timesteps / metrics_log_timestep_freq))
@@ -579,6 +603,10 @@ def train(hp, log_wandb):
     print(f'total training episodes: {total_training_episodes}')
     print(f'total training timesteps: {total_training_timesteps}')
     print(f'metrics log timestep frequency: {metrics_log_timestep_freq}')
+    print(
+        f'metric episodes per CSV/W&B row: {metric_episodes_per_row} '
+        f'({metric_episodes_per_row} episodes x {episode_length} timesteps)'
+    )
     print(f'expected CSV/W&B rows: {expected_metric_rows}')
 
     iteration_metrics_csv_path = init_mfos_metrics_csv(save_path, hp)
@@ -591,6 +619,8 @@ def train(hp, log_wandb):
     window_start_timestep = 0
     completed_episodes = 0
     completed_timesteps = 0
+    logged_episodes = 0
+    logged_timesteps = 0
     last_metric_timestep = 0
 
     for i in range(num_training_iterations):
@@ -602,7 +632,6 @@ def train(hp, log_wandb):
             hp,
             state['mfos_input_shape'],
         )
-        metric_window_batches.append(episodes)
 
         new_agent0, new_opt0_state, update_metrics = state['update_policy'](
             state['agent0'],
@@ -620,37 +649,44 @@ def train(hp, log_wandb):
         completed_episodes += episodes_per_iteration
         completed_timesteps += timesteps_per_iteration
         update_metric_row['walltime'] = time.time() - start_time
-        metric_window_update_rows.append(update_metric_row)
 
-        should_log_metrics = (
-            completed_timesteps - last_metric_timestep >= metrics_log_timestep_freq
-            or i == num_training_iterations - 1
-        )
-        if should_log_metrics:
-            metric_row = compute_mfos_iteration_metric_row(
-                episode_batches=metric_window_batches,
-                iteration=i,
-                episode=completed_episodes,
-                timestep=completed_timesteps,
-                window_start_iteration=window_start_iteration,
-                window_start_episode=window_start_episode,
-                window_start_timestep=window_start_timestep,
+        for start in range(0, episodes_per_iteration, metric_episodes_per_row):
+            end = start + metric_episodes_per_row
+            metric_window_batches.append(slice_episode_batch(episodes, start, end))
+            metric_window_update_rows.append(update_metric_row)
+            logged_episodes += metric_episodes_per_row
+            logged_timesteps += metric_episodes_per_row * episode_length
+
+            is_final_metric_chunk = i == num_training_iterations - 1 and end == episodes_per_iteration
+            should_log_metrics = (
+                logged_timesteps - last_metric_timestep >= metrics_log_timestep_freq
+                or is_final_metric_chunk
             )
-            for key in MFOS_METRIC_FIELDNAMES + ['walltime']:
-                values = [row[key] for row in metric_window_update_rows if key in row]
-                if values:
-                    metric_row[key] = float(np.mean(values))
+            if should_log_metrics:
+                metric_row = compute_mfos_iteration_metric_row(
+                    episode_batches=metric_window_batches,
+                    iteration=i,
+                    episode=logged_episodes,
+                    timestep=logged_timesteps,
+                    window_start_iteration=window_start_iteration,
+                    window_start_episode=window_start_episode,
+                    window_start_timestep=window_start_timestep,
+                )
+                for key in MFOS_METRIC_FIELDNAMES + ['walltime']:
+                    values = [row[key] for row in metric_window_update_rows if key in row]
+                    if values:
+                        metric_row[key] = float(np.mean(values))
 
-            append_mfos_metric_row(iteration_metrics_csv_path, metric_row)
-            if log_wandb:
-                wandb.log(format_wandb_metrics(metric_row), step=completed_timesteps)
+                append_mfos_metric_row(iteration_metrics_csv_path, metric_row)
+                if log_wandb:
+                    wandb.log(format_wandb_metrics(metric_row), step=logged_timesteps)
 
-            metric_window_batches = []
-            metric_window_update_rows = []
-            last_metric_timestep = completed_timesteps
-            window_start_iteration = i + 1
-            window_start_episode = completed_episodes
-            window_start_timestep = completed_timesteps
+                metric_window_batches = []
+                metric_window_update_rows = []
+                last_metric_timestep = logged_timesteps
+                window_start_iteration = i if end < episodes_per_iteration else i + 1
+                window_start_episode = logged_episodes
+                window_start_timestep = logged_timesteps
 
         if i % hp['eval_every'] == 0:
             print(f'iteration {i}, timestep {completed_timesteps}')

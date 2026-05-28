@@ -100,7 +100,7 @@ The CSV also logs Reciprocator diagnostics such as reciprocal-reward std/mean-ab
 
 ## JAX MFOS Self-Play on the Same Coin Game
 
-The JAX MFOS entry point uses the same 3x3 Coin Game, 200-step metric episodes, 20 metric episodes per CSV/W&B row, 4000 timesteps per row, and 3e7 total environment timesteps. The default run writes 7500 CSV/W&B rows. Internally it follows the official MFOS self-play structure with two independent MFOS learners, separate optimizers, environment resets at each MFOS inner-episode boundary, batch-averaged theta updates from the previous inner trajectory, and MFOS-style PPO returns. Each 200-step metric episode is aggregated from 10 MFOS inner episodes of 20 steps (`hp.mfos.inner_episode_length=20`), so metrics remain computed over fixed 200-step windows.
+The JAX MFOS entry point uses the same 3x3 Coin Game and 200-step episodes. The default training batch remains 20 episodes, but metric logging splits each batch into two 10-episode rows, so each CSV/W&B row averages 2000 environment timesteps. With the default `hp.max_train_timestep=15000000` and `hp.metrics_log_timestep_freq=2000`, the default run writes 7500 CSV/W&B rows. Each 200-step metric episode is aggregated from 10 MFOS inner episodes of 20 steps (`hp.mfos.inner_episode_length=20`), so per-episode metrics remain computed over fixed 200-step windows.
 
 Run one seed:
 ```bash
@@ -124,7 +124,6 @@ done
 
 MFOS CSVs are saved as `experiments/<run_id>/selfplay_MFOS_seed<seed>.csv`.
 The CSV also logs MFOS diagnostics such as PPO loss, entropy, gradient norm, theta mean/std, and per-action frequencies.
-
 
 
 
