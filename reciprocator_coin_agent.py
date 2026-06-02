@@ -4,6 +4,8 @@ from jax import numpy as jp, random as rax
 
 from ipd import POLAGRU
 
+METAL_COMPATIBLE_RECURRENT_KERNEL_INIT = nn.initializers.xavier_uniform()
+
 
 class CoinStateEncoder(nn.Module):
     obs_shape: tuple
@@ -45,8 +47,18 @@ class ConvGRUActorCriticCoinAgent(nn.Module):
             hidden_size=self.hidden_size_value,
             out_channels=self.conv_out_channels,
         )
-        self.actor_head = POLAGRU(self.num_actions, self.hidden_size_actor, self.layers_before_gru_actor)
-        self.value_head = POLAGRU(1, self.hidden_size_value, self.layers_before_gru_value)
+        self.actor_head = POLAGRU(
+            self.num_actions,
+            self.hidden_size_actor,
+            self.layers_before_gru_actor,
+            recurrent_kernel_init=METAL_COMPATIBLE_RECURRENT_KERNEL_INIT,
+        )
+        self.value_head = POLAGRU(
+            1,
+            self.hidden_size_value,
+            self.layers_before_gru_value,
+            recurrent_kernel_init=METAL_COMPATIBLE_RECURRENT_KERNEL_INIT,
+        )
 
     def __call__(self, x):
         obs_seq = x['obs_seq']
@@ -106,8 +118,18 @@ class GRUActorCriticCoinAgent(nn.Module):
     layers_before_gru_value: int
 
     def setup(self):
-        self.actor_head = POLAGRU(self.num_actions, self.hidden_size_actor, self.layers_before_gru_actor)
-        self.value_head = POLAGRU(1, self.hidden_size_value, self.layers_before_gru_value)
+        self.actor_head = POLAGRU(
+            self.num_actions,
+            self.hidden_size_actor,
+            self.layers_before_gru_actor,
+            recurrent_kernel_init=METAL_COMPATIBLE_RECURRENT_KERNEL_INIT,
+        )
+        self.value_head = POLAGRU(
+            1,
+            self.hidden_size_value,
+            self.layers_before_gru_value,
+            recurrent_kernel_init=METAL_COMPATIBLE_RECURRENT_KERNEL_INIT,
+        )
 
     def __call__(self, x):
         obs_seq = x['obs_seq']
@@ -193,3 +215,37 @@ class ScalarPredictor(nn.Module):
         x = nn.Dense(self.hidden_size)(x)
         x = nn.relu(x)
         return nn.Dense(self.output_size)(x)
+
+
+class CoinStateValuePredictor(nn.Module):
+    obs_shape: tuple
+    hidden_size: int
+    out_channels: int
+    output_size: int
+
+    @nn.compact
+    def __call__(self, obs):
+        obs = obs.reshape((-1, *self.obs_shape))
+        encoder = CoinStateEncoder(
+            obs_shape=self.obs_shape,
+            hidden_size=self.hidden_size,
+            out_channels=self.out_channels,
+        )
+        features = jax.vmap(encoder)(obs)
+        return nn.Dense(self.output_size)(features)
+
+
+class DiscreteTransitionPredictor(nn.Module):
+    hidden_size: int
+    num_channels: int
+    num_classes: int
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(self.hidden_size)(x)
+        x = nn.relu(x)
+        x = nn.Dense(self.hidden_size)(x)
+        x = nn.relu(x)
+        logits = nn.Dense(self.num_channels * self.num_classes)(x)
+        logits = logits.reshape((-1, self.num_channels, self.num_classes))
+        return nn.log_softmax(logits, axis=-1)

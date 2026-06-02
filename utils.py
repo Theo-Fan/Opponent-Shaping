@@ -35,7 +35,7 @@ def rscope(rng, *path):
 
 
 def clip_grads(grads, max_grad):
-    return jax.tree_map(lambda dx: jp.clip(dx, -max_grad, +max_grad), grads)
+    return jax.tree_util.tree_map(lambda dx: jp.clip(dx, -max_grad, +max_grad), grads)
 
 
 def clip_grads_by_norm(updates, max_norm):
@@ -56,7 +56,7 @@ def global_norm(updates):
 
 
 def npify(tree):
-    return jax.tree_map(lambda p: np.array(p), tree)
+    return jax.tree_util.tree_map(lambda p: np.array(p), tree)
 
 
 class AliasDict(dict):

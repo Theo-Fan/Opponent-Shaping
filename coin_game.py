@@ -217,7 +217,7 @@ def make_zero_episode(trace_length, coin_game, dtype='float32'):
     coin_owner = jp.zeros([trace_length + 1, 1], dtype="int32")
     player1_pos = jp.zeros([trace_length + 1, 2], dtype="int32")
     player2_pos = jp.zeros([trace_length + 1, 2], dtype="int32")
-    games = jax.tree_map(lambda x: jp.expand_dims(x, axis=0).repeat(trace_length + 1, axis=0), coin_game)
+    games = jax.tree_util.tree_map(lambda x: jp.expand_dims(x, axis=0).repeat(trace_length + 1, axis=0), coin_game)
     return dict(obs=obs,
                 act=act,
                 rew=rew,
@@ -334,10 +334,10 @@ def get_new_distances(episode, t, hp, rng, distance_of_this_player):
     new_distances = jax.vmap(lambda a: get_new_distance(a))(jp.arange(hp['game']['gnumactions']))
     shuffle_rng = rax.split(rng, 1)[0]
     # shuffle new_distances
-    shuffled_distances = jax.tree_map(lambda x: rax.shuffle(shuffle_rng, x, axis=0), new_distances)
+    shuffled_distances = jax.tree_util.tree_map(lambda x: rax.shuffle(shuffle_rng, x, axis=0), new_distances)
     # now sort by new distance
     indices = jp.argsort(shuffled_distances['new_distance'])
-    sorted_distances = jax.tree_map(lambda x: x[indices], shuffled_distances)
+    sorted_distances = jax.tree_util.tree_map(lambda x: x[indices], shuffled_distances)
     return {'new_distances': new_distances, 'sorted_distances': sorted_distances}
 
 def get_cooperative_action(episode, t, hp, rng, agent_player, other_player):
@@ -367,10 +367,10 @@ def play_episode_scan(env, get_actions, rng, trace_length, qa_auxes=None):
 
     def body_fn(carry, _):
         env, rng, episode, t, qa_auxes = carry
-        qa_aux = jax.tree_map(lambda x: x[t], qa_auxes) if qa_auxes is not None else None
+        qa_aux = jax.tree_util.tree_map(lambda x: x[t], qa_auxes) if qa_auxes is not None else None
         rng, subrng = rax.split(rng)
         old_game = env
-        episode['games'] = jax.tree_map(lambda x, o: x.at[t].set(o), episode['games'], env)
+        episode['games'] = jax.tree_util.tree_map(lambda x, o: x.at[t].set(o), episode['games'], env)
         act, aux = get_actions(subrng, env, episode, t) if qa_aux is None else get_actions(subrng, env, episode, t, qa_aux=qa_aux)
         assert act.shape == (2,)
         env, obs, rew = env.step(act)
@@ -385,7 +385,7 @@ def play_episode_scan(env, get_actions, rng, trace_length, qa_auxes=None):
 
     (env, rng, episode, _, _), aux = jax.lax.scan(f=body_fn, init=(env, rng, episode, 0, qa_auxes), xs=(), length=trace_length)
     last_game = env
-    episode['games'] = jax.tree_map(lambda x, o: x.at[trace_length].set(o), episode['games'], last_game)
+    episode['games'] = jax.tree_util.tree_map(lambda x, o: x.at[trace_length].set(o), episode['games'], last_game)
     return episode, aux
 
 @partial(jax.jit, static_argnames=('hp',))

@@ -519,7 +519,7 @@ def make_zero_episode(trace_length, coin_game, dtype='float32'):
     coin_owner = jp.zeros([trace_length + 1, 1], dtype="int32")
     player1_pos = jp.zeros([trace_length + 1, 2], dtype="int32")
     player2_pos = jp.zeros([trace_length + 1, 2], dtype="int32")
-    games = jax.tree_map(lambda x: jp.expand_dims(x, axis=0).repeat(trace_length+1, axis=0), coin_game)
+    games = jax.tree_util.tree_map(lambda x: jp.expand_dims(x, axis=0).repeat(trace_length+1, axis=0), coin_game)
     return dict(obs=obs,
                 act=act,
                 rew=rew,
@@ -542,10 +542,10 @@ def play_episode_unroll(env, get_actions, rng, trace_length, qa_auxes=None):
     start_time = time.time()
     auxes = []
     for t in range(trace_length):
-        qa_aux = jax.tree_map(lambda x: x[t], qa_auxes) if qa_auxes is not None else None
+        qa_aux = jax.tree_util.tree_map(lambda x: x[t], qa_auxes) if qa_auxes is not None else None
         rng, subrng = rax.split(rng)
         old_game = env
-        episode['games'] = jax.tree_map(lambda x, o: x.at[t].set(o), episode['games'], old_game)
+        episode['games'] = jax.tree_util.tree_map(lambda x, o: x.at[t].set(o), episode['games'], old_game)
         act, aux = get_actions(subrng, env, episode, t) if qa_aux is None else get_actions(subrng, env, episode, t, qa_aux=qa_aux)
         env, obs, rew = env.step(act)
         jax.debug.print(f't: {t} time passed: {time.time() - start_time}')
@@ -559,7 +559,7 @@ def play_episode_unroll(env, get_actions, rng, trace_length, qa_auxes=None):
         auxes.append(aux)
 
     last_game = env
-    episode['games'] = jax.tree_map(lambda x, o: x.at[trace_length].set(o), episode['games'], last_game)
+    episode['games'] = jax.tree_util.tree_map(lambda x, o: x.at[trace_length].set(o), episode['games'], last_game)
 
     auxes = jax.tree_util.tree_map(lambda *xs: jp.stack(xs, axis=0), *auxes)
     return episode, auxes
@@ -577,10 +577,10 @@ def play_episode_scan(env, get_actions, rng, trace_length, qa_auxes=None):
 
     def body_fn(carry, _):
         env, rng, episode, t, qa_auxes = carry
-        qa_aux = jax.tree_map(lambda x: x[t], qa_auxes) if qa_auxes is not None else None
+        qa_aux = jax.tree_util.tree_map(lambda x: x[t], qa_auxes) if qa_auxes is not None else None
         rng, subrng = rax.split(rng)
         old_game = env
-        episode['games'] = jax.tree_map(lambda x, o: x.at[t].set(o), episode['games'], env)
+        episode['games'] = jax.tree_util.tree_map(lambda x, o: x.at[t].set(o), episode['games'], env)
         act, aux = get_actions(subrng, env, episode, t) if qa_aux is None else get_actions(subrng, env, episode, t, qa_aux=qa_aux)
         assert act.shape == (2,)
         env, obs, rew = env.step(act)
@@ -595,7 +595,7 @@ def play_episode_scan(env, get_actions, rng, trace_length, qa_auxes=None):
 
     (env, rng, episode, _, _), aux = jax.lax.scan(f=body_fn, init=(env, rng, episode, 0, qa_auxes), xs=(), length=trace_length)
     last_game = env
-    episode['games'] = jax.tree_map(lambda x, o: x.at[trace_length].set(o), episode['games'], last_game)
+    episode['games'] = jax.tree_util.tree_map(lambda x, o: x.at[trace_length].set(o), episode['games'], last_game)
     return episode, aux
 
 def play_episode_scan_inner_gru(env, get_actions, rng, trace_length, qa_auxes=None, agent_carry_0_t=None):
@@ -610,10 +610,10 @@ def play_episode_scan_inner_gru(env, get_actions, rng, trace_length, qa_auxes=No
 
     def body_fn(carry, _):
         env, rng, episode, t, qa_auxes, agent_carry_0_t = carry
-        qa_aux = jax.tree_map(lambda x: x[t], qa_auxes) if qa_auxes is not None else None
+        qa_aux = jax.tree_util.tree_map(lambda x: x[t], qa_auxes) if qa_auxes is not None else None
         rng, subrng = rax.split(rng)
         old_game = env
-        episode['games'] = jax.tree_map(lambda x, o: x.at[t].set(o), episode['games'], env)
+        episode['games'] = jax.tree_util.tree_map(lambda x, o: x.at[t].set(o), episode['games'], env)
         act, aux = get_actions(subrng, env, episode, t, agent_carry_0_t) if qa_aux is None else get_actions(subrng, env, episode, t, agent_carry_0_t, qa_aux=qa_aux)
         agent_carry_0_tp1 = aux['agent_carry_0_tp1']
         assert act.shape == (2,)
@@ -629,7 +629,7 @@ def play_episode_scan_inner_gru(env, get_actions, rng, trace_length, qa_auxes=No
 
     (env, rng, episode, _, _, _), aux = jax.lax.scan(f=body_fn, init=(env, rng, episode, 0, qa_auxes, agent_carry_0_t), xs=(), length=trace_length)
     last_game = env
-    episode['games'] = jax.tree_map(lambda x, o: x.at[trace_length].set(o), episode['games'], last_game)
+    episode['games'] = jax.tree_util.tree_map(lambda x, o: x.at[trace_length].set(o), episode['games'], last_game)
     return episode, aux
 
 def play_episode_scan_agent_detective_gru(env, get_actions, rng, trace_length, qa_auxes=None, agent_carry_0_t=None, detective_carry_0_t=None):
@@ -644,10 +644,10 @@ def play_episode_scan_agent_detective_gru(env, get_actions, rng, trace_length, q
 
     def body_fn(carry, _):
         env, rng, episode, t, qa_auxes, agent_carry_0_t, detective_carry_0_t = carry
-        qa_aux = jax.tree_map(lambda x: x[t], qa_auxes) if qa_auxes is not None else None
+        qa_aux = jax.tree_util.tree_map(lambda x: x[t], qa_auxes) if qa_auxes is not None else None
         rng, subrng = rax.split(rng)
         old_game = env
-        episode['games'] = jax.tree_map(lambda x, o: x.at[t].set(o), episode['games'], env)
+        episode['games'] = jax.tree_util.tree_map(lambda x, o: x.at[t].set(o), episode['games'], env)
         act, aux = get_actions(subrng,
                                env,
                                episode,
@@ -670,7 +670,7 @@ def play_episode_scan_agent_detective_gru(env, get_actions, rng, trace_length, q
 
     (env, rng, episode, _, _, _, _), aux = jax.lax.scan(f=body_fn, init=(env, rng, episode, 0, qa_auxes, agent_carry_0_t, detective_carry_0_t), xs=(), length=trace_length)
     last_game = env
-    episode['games'] = jax.tree_map(lambda x, o: x.at[trace_length].set(o), episode['games'], last_game)
+    episode['games'] = jax.tree_util.tree_map(lambda x, o: x.at[trace_length].set(o), episode['games'], last_game)
     return episode, aux
 
 def play_episode_scan_agent_and_agent_gru(env, get_actions, rng, trace_length, qa_auxes=None, agent_1_carry_0_t=None, agent_2_carry_0_t=None):
@@ -685,10 +685,10 @@ def play_episode_scan_agent_and_agent_gru(env, get_actions, rng, trace_length, q
 
     def body_fn(carry, _):
         env, rng, episode, t, qa_auxes, agent_1_carry_0_t, agent_2_carry_0_t = carry
-        qa_aux = jax.tree_map(lambda x: x[t], qa_auxes) if qa_auxes is not None else None
+        qa_aux = jax.tree_util.tree_map(lambda x: x[t], qa_auxes) if qa_auxes is not None else None
         rng, subrng = rax.split(rng)
         old_game = env
-        episode['games'] = jax.tree_map(lambda x, o: x.at[t].set(o), episode['games'], env)
+        episode['games'] = jax.tree_util.tree_map(lambda x, o: x.at[t].set(o), episode['games'], env)
         act, aux = get_actions(subrng,
                                env,
                                episode,
@@ -711,7 +711,7 @@ def play_episode_scan_agent_and_agent_gru(env, get_actions, rng, trace_length, q
 
     (env, rng, episode, _, _, _, _), aux = jax.lax.scan(f=body_fn, init=(env, rng, episode, 0, qa_auxes, agent_1_carry_0_t, agent_2_carry_0_t), xs=(), length=trace_length)
     last_game = env
-    episode['games'] = jax.tree_map(lambda x, o: x.at[trace_length].set(o), episode['games'], last_game)
+    episode['games'] = jax.tree_util.tree_map(lambda x, o: x.at[trace_length].set(o), episode['games'], last_game)
     return episode, aux
 
 
@@ -1064,14 +1064,14 @@ def episodes_to_grid_image(episodes, max_batch):
     batch_size = episodes['act'].shape[0]
     if batch_size > max_batch:
         batch_size = max_batch
-        episodes = jax.tree_map(lambda x: x[:batch_size], episodes)
+        episodes = jax.tree_util.tree_map(lambda x: x[:batch_size], episodes)
 
-    game_sample = jax.tree_map(lambda x: x[0], episodes)
+    game_sample = jax.tree_util.tree_map(lambda x: x[0], episodes)
     trace_length = game_sample['coin_pos'].shape[0]
     def complete_episodes_to_images(games):
-        images = [buffer_plot_and_get(plot_game(jax.tree_map(lambda x: x[i], games))) for i in range(trace_length)]
+        images = [buffer_plot_and_get(plot_game(jax.tree_util.tree_map(lambda x: x[i], games))) for i in range(trace_length)]
         return images
-    images = [complete_episodes_to_images(jax.tree_map(lambda x: x[i], episodes)) for i in range(batch_size)]
+    images = [complete_episodes_to_images(jax.tree_util.tree_map(lambda x: x[i], episodes)) for i in range(batch_size)]
 
     num_rows = len(images)
     num_columns = len(images[0])

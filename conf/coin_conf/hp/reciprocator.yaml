@@ -9,9 +9,9 @@ max_train_timestep: 30000000
 metrics_log_timestep_freq: 4000
 
 reciprocator:
-  reciprocal_reward_type: 'signed_petty_payoff'
+  reciprocal_reward_type: 'petty_payoff'
   reciprocal_reward_weight: 1.0
-  normalize_reciprocal_reward: True
+  normalize_reciprocal_reward: False
   policy:
     model: 'conv_gru'
     hidden_size_actor: 16
@@ -20,17 +20,16 @@ reciprocator:
     layers_before_gru_actor: 1
     layers_before_gru_value: 1
     lr: 0.005
-    ppo_epochs: 5
+    ppo_epochs: 40
     eps_clip: 0.15
-    entropy_weight: 0.05
-    clip_grad_norm: 1.0
+    entropy_weight: 0.01
   influence:
-    hidden_size: 64
+    hidden_size: 32
     lr: 0.01
-    num_initialization_iterations: 50
-    initialization_target_period: 5
-    target_period: 5
-    target_epochs: 5
-    target_buffer_size: 8
+    num_initialization_iterations: 1
+    initialization_target_period: 1
+    target_period: 1
+    target_epochs: 20
+    target_buffer_size: 4
     target_batch_size: 4096
-    num_train_batches: 32
+    num_train_batches: 64

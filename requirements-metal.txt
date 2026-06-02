@@ -1,0 +1,7 @@
+# Install after requirements.txt on Apple silicon Macs.
+# jax-metal 0.1.1 requires matching jax/jaxlib versions >= 0.4.34.
+
+jax==0.4.34
+jaxlib==0.4.34
+flax==0.8.5
+jax-metal==0.1.1

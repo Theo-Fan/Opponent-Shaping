@@ -56,10 +56,10 @@ def global_norm(updates):
 def grad_max(grads):
     if grads.params is None:
         return 0.0
-    return jp.max(jp.concatenate(jax.tree_leaves(jax.tree_map(lambda x: jp.abs(x).max().reshape(1), grads))))
+    return jp.max(jp.concatenate(jax.tree_util.tree_leaves(jax.tree_util.tree_map(lambda x: jp.abs(x).max().reshape(1), grads))))
 
 def clip_grads(grads, max_grad):
-    return jax.tree_map(lambda dx: jp.clip(dx, -max_grad, +max_grad), grads)
+    return jax.tree_util.tree_map(lambda dx: jp.clip(dx, -max_grad, +max_grad), grads)
 
 def clip_by_l2_norm(x, max_norm):
     # taken from https://github.com/deepmind/rlax/blob/dc048fdbc8903dd001ccd899f45d744bb3c1e2c6/rlax/_src/policy_gradients.py
@@ -233,7 +233,7 @@ def update_target(old_target, new, value_target_update_config):
         tau = target_update_config['tau']
         old_target_params = old_target.params
         new_params = new.params
-        new_target_params = jax.tree_map(lambda old, new: old * tau + new * (1 - tau), old_target_params, new_params)
+        new_target_params = jax.tree_util.tree_map(lambda old, new: old * tau + new * (1 - tau), old_target_params, new_params)
         return old_target.replace(params=new_target_params)
     else:
         raise f'Unknown target_update_config: {target_update_config}'
@@ -244,7 +244,7 @@ def add_noise(tree, noise_scale, seed, mask):
     leaves, tree_def = jax.tree_util.tree_flatten(tree)
     seeds = rax.split(seed, len(leaves))
     seed_tree = jax.tree_util.tree_unflatten(tree_def, seeds)
-    noisy_tree = jax.tree_map(lambda x, s, m: x + m*rax.normal(key=s, shape=x.shape, dtype=x.dtype) * noise_scale, tree, seed_tree, mask)
+    noisy_tree = jax.tree_util.tree_map(lambda x, s, m: x + m*rax.normal(key=s, shape=x.shape, dtype=x.dtype) * noise_scale, tree, seed_tree, mask)
     return noisy_tree
 
 
@@ -376,4 +376,4 @@ def magic_box(z):
     return jp.exp(z - jax.lax.stop_gradient(z))
 
 def npify(tree):
-    return jax.tree_map(lambda p: np.array(p), tree)
+    return jax.tree_util.tree_map(lambda p: np.array(p), tree)

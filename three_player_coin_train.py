@@ -32,12 +32,12 @@ class Optimizer:
 
 @jax.jit
 def tree_stack(xs):
-    return jax.tree_map(lambda *args: jp.stack(args), *xs)
+    return jax.tree_util.tree_map(lambda *args: jp.stack(args), *xs)
 
 
 @partial(jax.jit, static_argnames=('B',))
 def tree_unstack(xs, B):
-    episodes = [jax.tree_map(lambda x: x[i], xs) for i in range(B)]
+    episodes = [jax.tree_util.tree_map(lambda x: x[i], xs) for i in range(B)]
     return episodes
 
 
@@ -111,7 +111,7 @@ def set_up_state_from_config(hp):
     def create_rb_agent_params(player_id: int):
         rb_size = hp['agent_replay_buffer']['capacity']
         tmp_rb = [state[f'agent{player_id}'].params for _ in range(rb_size)]
-        state[f'rb_agent{player_id}_params'] = jax.tree_map(lambda *xs: jp.stack(xs, axis=0), *tmp_rb)
+        state[f'rb_agent{player_id}_params'] = jax.tree_util.tree_map(lambda *xs: jp.stack(xs, axis=0), *tmp_rb)
         state['min_valid_index_rb'] = rb_size  # first, the buffer is not valid
 
     if use_rb(hp):
@@ -217,9 +217,9 @@ def sample_agent_params(hp, rb, agent, rb_rng, min_valid_index: int):
     sample_size = B - cur_agent_size
 
     agent_indices = jax.random.randint(rb_rng, shape=(sample_size,), minval=min_valid_index, maxval=rb_size)
-    sample_params = jax.tree_map(lambda x: x[agent_indices], rb)
+    sample_params = jax.tree_util.tree_map(lambda x: x[agent_indices], rb)
     agent_params = jax.vmap(lambda i: agent.params)(jp.arange(cur_agent_size))
-    final_agent_params = jax.tree_map(lambda *xs: jp.concatenate(xs, axis=0), sample_params, agent_params)
+    final_agent_params = jax.tree_util.tree_map(lambda *xs: jp.concatenate(xs, axis=0), sample_params, agent_params)
 
     return final_agent_params
 
@@ -439,9 +439,9 @@ def train(hp, log_wandb):
 
 @jax.jit
 def push_to_rb(rb, params):
-    to_keep_rb = jax.tree_map(lambda x: x[1:], rb)
-    params = jax.tree_map(lambda x: x[None], params)
-    new_rb = jax.tree_map(lambda x, y: jp.concatenate((x, y), axis=0), to_keep_rb, params)
+    to_keep_rb = jax.tree_util.tree_map(lambda x: x[1:], rb)
+    params = jax.tree_util.tree_map(lambda x: x[None], params)
+    new_rb = jax.tree_util.tree_map(lambda x, y: jp.concatenate((x, y), axis=0), to_keep_rb, params)
     return new_rb
 
 
@@ -522,7 +522,7 @@ def play_episode_scan_inner_gru(inp, trace_length, env):
         aux = {}
         env, rng, episode, t, c_0_actor, c_0_qvalue, c_1_actor, c_1_qvalue, c_2_actor, c_2_qvalue = carry
         rng, rng0, rng1, rng2 = rax.split(rng, 4)
-        episode['games'] = jax.tree_map(lambda x, o: x.at[t].set(o), episode['games'], env)
+        episode['games'] = jax.tree_util.tree_map(lambda x, o: x.at[t].set(o), episode['games'], env)
         prev_obs_0 = episode['obs'][t, 0].reshape(-1)
         prev_obs_1 = episode['obs'][t, 1].reshape(-1)
         prev_obs_2 = episode['obs'][t, 2].reshape(-1)
@@ -558,7 +558,7 @@ def play_episode_scan_inner_gru(inp, trace_length, env):
 
     (env, rng, episode, _, _, _, _, _, _, _), aux = jax.lax.scan(f=body_fn, init=(env, rng, episode, 0, c_0_actor, c_0_qvalue, c_1_actor, c_1_qvalue, c_2_actor, c_2_qvalue), xs=(), length=trace_length)
     last_game = env
-    episode['games'] = jax.tree_map(lambda x, o: x.at[trace_length].set(o), episode['games'], last_game)
+    episode['games'] = jax.tree_util.tree_map(lambda x, o: x.at[trace_length].set(o), episode['games'], last_game)
     return episode, aux
 
 
@@ -582,7 +582,7 @@ def train_agent_qvalue(state, hp, episodes, player_to_train: int):
     new_agent = aux['agent']
     state[f'agent{player_to_train}'] = new_agent
     ema_gamma = hp['qvalue']['train']['target_ema_gamma']
-    agent_ema_params = jax.tree_map(lambda old, new: ema_gamma * old + (1 - ema_gamma) * new, agent_ema.params, new_agent.params)
+    agent_ema_params = jax.tree_util.tree_map(lambda old, new: ema_gamma * old + (1 - ema_gamma) * new, agent_ema.params, new_agent.params)
     state[f'agent{player_to_train}_ema'] = agent_ema.replace(params=agent_ema_params)
     state[f'agent{player_to_train}_opt_qvalue'] = agent_opt.replace(opt_state=aux['new_opt_state'])
     return aux
@@ -863,8 +863,8 @@ def update_agent_actor(agent, opponents, optimizers, hp, episodes, player_to_tra
         return jp.stack([loss_agent, loss_opponent]), aux
 
     grads, aux = jax.jacobian(loss_fn, has_aux=True)(agent)
-    grad_agent = jax.tree_map(lambda x: x[0], grads)
-    grad_opponent = jax.tree_map(lambda x: x[1], grads)
+    grad_agent = jax.tree_util.tree_map(lambda x: x[0], grads)
+    grad_opponent = jax.tree_util.tree_map(lambda x: x[1], grads)
 
     def clip_grad(g):
         clip_grad_config = hp['actor']['train']['clip_grad']
@@ -880,7 +880,7 @@ def update_agent_actor(agent, opponents, optimizers, hp, episodes, player_to_tra
     if hp['actor']['train']['separate'] == 'disabled':
         opt_loss = optimizers['opt_loss']
         if include_opponent:
-            grad = jax.tree_map(lambda a, b: a + hp['opponent_differentiation_weight'] * b, grad_agent, grad_opponent)
+            grad = jax.tree_util.tree_map(lambda a, b: a + hp['opponent_differentiation_weight'] * b, grad_agent, grad_opponent)
         else:
             grad = grad_agent
 

@@ -98,7 +98,7 @@ def agent_loss(agent, episodes, hp):
         }  # [1]
 
     aux = jax.vmap(loss_single_episode)(episodes)
-    return jax.tree_map(lambda x: x.mean(), aux)
+    return jax.tree_util.tree_map(lambda x: x.mean(), aux)
 
 
 @partial(jax.jit, static_argnames=('hp', 'do_ppo'))

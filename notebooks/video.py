@@ -151,12 +151,12 @@ def main(agent1_name, agent2_name): # for example agent1_name='loqa_2i4vsulp', a
                                                               for_instead_of_vmap=False, )
     episodes = episode_logs[(agent1_name, agent2_name)][0]
 
-    episode = jax.tree_map(lambda x: x[0], episodes)
+    episode = jax.tree_util.tree_map(lambda x: x[0], episodes)
     episode['ret'] = jax.numpy.cumsum(episode['rew'], axis=0)
     fig, ax = plt.subplots(figsize=(4, 4))
     def update(frame):
         t = frame // 2
-        game = jax.tree_map(lambda x: x[t], episode)
+        game = jax.tree_util.tree_map(lambda x: x[t], episode)
         ax.clear()
         plot_game(game, ax=ax, info={'time_step': t,
                                      'agent1': clean_agent_name_dict[agent1_name],

@@ -17,6 +17,27 @@ https://github.com/google/jax) and [flax](https://github.com/google/flax) reposi
 
 Also, while the code most probably will be fine with newer versions of `jax` and `flax` there is a slight chance it breaks because these two are not backward compatible. In that case, just install the older one, or you may need to do some code changes (which understandably is not on anyone's wishlist. But, it happens sometimes. During the development of this own project, the flax UI for GRUs changed. First, I thought I somehow have corrupted the code and took me a long time to understand it was just a simple change).
 
+### Apple Silicon Metal Backend
+
+On an Apple silicon Mac, install the Apple Metal plug-in after the base requirements:
+
+```bash
+pip install -r requirements.txt
+pip install -r requirements-metal.txt
+```
+
+Verify that JAX sees the Apple GPU:
+
+```bash
+python -c "import jax; print(jax.default_backend()); print(jax.devices())"
+```
+
+The expected backend is `METAL`. Apple marks the plug-in as experimental, so unsupported JAX operations may still require CPU fallback:
+
+```bash
+JAX_PLATFORMS=cpu python reciprocator_coin_train.py hp=reciprocator wandb.state=disabled
+```
+
 # Understanding the LOQA's Implementation
 If you want to implement LOQA as a basline or if you want to improve upon LOQA, we recommend studying the `ipd.py` first. This a self-containing script that runs LOQA on IPD. After that understanding `coin_train.py` should be easier. Also, you can jump straight into the coin script. The main LOQA magic is happening in the `agent_policy_loss` method. LOQA can have different implementations, based on how you make the rewards differentiable. `n-step` just makes the next n rewards differentiable. However, `loaded-dice` is the main condition used in LOQA results that makes the whole return differentiable but it is harder to understan. In order to understand what is happening with the DICE, you can study the DICE and Loaded-DICE paper. However, just keep in mind at the end DICE is an engineering trick. All of these terms coudl have been written as expectations like how we write REINFORCE. But DICE makes this much easier. Just note that the `magic_box` gives you 1 in the forward pass, but in the backward pass it switches to log probability. That is the key to understanding DICE. If you have any questions, just message me on my email: mi[dot]aghajohari[at]gmail[dot]com
 
@@ -30,6 +51,23 @@ This repository is configured to run LOQA self-play on the modified 3x3 Coin Gam
 - metrics are written to `experiments/<run_id>/selfplay_LOQA_seed<seed>.csv`;
 - when W&B is enabled, `<run_id>` is the W&B run id;
 - W&B metrics are grouped with slash prefixes, for example `agent0/same_color_pickups`, `agent1/different_color_pickups`, `agent0/same_color_pickup_ratio`, `agent1/mean_reward`, `global/reward_difference`, and `global/average_reward`.
+
+All three JAX self-play entry points use the same W&B organization by default:
+
+```text
+project: memory_sweep
+group: coingame_selfplay
+run name: self-play_<ALGORITHM>_seed<seed>
+```
+
+Override these values with Hydra when needed:
+
+```bash
+python coin_train.py hp=loqa_iclr wandb.state=enabled \
+  wandb.project=memory_sweep \
+  wandb.group=coingame_selfplay \
+  'wandb.run_name=self-play_{algorithm}_seed{seed}'
+```
 
 run:
 ```bash
@@ -73,7 +111,7 @@ done
 
 ## JAX Reciprocator Self-Play on the Same Coin Game
 
-The JAX Reciprocator entry point uses the same modified 3x3 Coin Game setup as the LOQA command above: 200 steps per episode, 20 episodes per metric row, 4000 timesteps per CSV/W&B write, and 3e7 total environment timesteps. The default policy is a convolutional encoder plus GRU, closer to the original Reciprocator coin-game actor-critic than the earlier flatten-observation GRU.
+The JAX Reciprocator entry point uses the same modified 3x3 Coin Game setup as the LOQA command above: 200 steps per episode, 20 episodes per metric row, 4000 timesteps per CSV/W&B write, and 3e7 total environment timesteps. It ports the original Coin Reciprocator algorithm to JAX: two independent convolutional-GRU PPO policies share reward, counterfactual-reward, state-value, transition, and counterfactual-transition estimators. The value of influence is computed as immediate reward influence plus the discounted expected state-value difference induced by the learned transition models.
 
 Run one seed:
 ```bash
@@ -84,7 +122,7 @@ python reciprocator_coin_train.py hp=reciprocator wandb.state=enabled "wandb.tag
 
 Run a short smoke test without W&B:
 ```bash
-python reciprocator_coin_train.py hp=reciprocator wandb.state=disabled hp.max_train_timestep=4000 hp.reciprocator.influence.num_initialization_iterations=0 hp.reciprocator.influence.target_period=1 hp.reciprocator.influence.target_epochs=1 hp.reciprocator.influence.num_train_batches=1 hp.reciprocator.influence.target_batch_size=512 hp.save_every=999999 hp.eval_every=999999
+python reciprocator_coin_train.py hp=reciprocator wandb.state=disabled hp.batch_size=1 hp.max_train_timestep=200 hp.reciprocator.influence.num_initialization_iterations=0 hp.reciprocator.influence.target_period=1 hp.reciprocator.influence.target_epochs=1 hp.reciprocator.influence.num_train_batches=1 hp.reciprocator.influence.target_batch_size=32 hp.reciprocator.policy.ppo_epochs=1 hp.save_every=999999 hp.eval_every=999999
 ```
 
 Run five seeds:
@@ -95,7 +133,7 @@ for seed in 21 22 23 24 25; do
 done
 ```
 
-Reciprocator CSVs are saved as `experiments/<run_id>/selfplay_RECIPROCATOR_seed<seed>.csv`.
+Reciprocator CSVs are saved as `experiments/<run_id>/selfplay_RECIPROCATOR_seed<seed>.csv`. Override `hp.seed=<seed>` to run different seeds. With the default `hp.max_train_timestep=30000000` and `hp.metrics_log_timestep_freq=4000`, each completed run writes exactly 7500 CSV data rows.
 The CSV also logs Reciprocator diagnostics such as reciprocal-reward std/mean-absolute value, shaped returns, pickup correlations, and per-action frequencies.
 
 ## JAX MFOS Self-Play on the Same Coin Game
@@ -124,9 +162,3 @@ done
 
 MFOS CSVs are saved as `experiments/<run_id>/selfplay_MFOS_seed<seed>.csv`.
 The CSV also logs MFOS diagnostics such as PPO loss, entropy, gradient norm, theta mean/std, and per-action frequencies.
-
-
-
-
-
-

@@ -68,10 +68,10 @@ def eval_agents(agent1, agent2, batch_size: int, rng: rax.PRNGKey, hp, coin_game
     else: # just because m-fos is a torch module and we cannot vmap over it
         episodes = []
         for i, rng in enumerate(rscope(rngs, "game_play")):
-            init_env = jax.tree_map(lambda x: x[i], init_envs)
+            init_env = jax.tree_util.tree_map(lambda x: x[i], init_envs)
             episode, _ = play_episode_unroll(init_env, get_actions, rng, trace_length=hp['trace_length'])
             episodes.append(episode)
-        episodes = jax.tree_map(lambda *x: jp.stack(x), *episodes)
+        episodes = jax.tree_util.tree_map(lambda *x: jp.stack(x), *episodes)
 
     return episodes
 

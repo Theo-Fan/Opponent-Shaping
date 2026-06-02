@@ -1,7 +1,6 @@
 import csv
 import os
 import pickle
-import shutil
 import time
 from datetime import datetime
 from functools import partial
@@ -30,10 +29,11 @@ from coin_train import (
     get_num_training_timesteps_per_iteration,
     get_total_training_episodes,
     get_total_training_timesteps,
+    initialize_wandb,
     scalar_mean,
 )
 from mfos_coin_agent import MFOSCoinAgent
-from utils import clip_grads_by_norm, global_norm, npify, rscope, slurm_infos
+from utils import clip_grads_by_norm, global_norm, npify, rscope
 
 
 MFOS_METRIC_FIELDNAMES = [
@@ -103,11 +103,11 @@ def get_metric_episodes_per_row(hp):
 
 
 def slice_episode_batch(episodes, start, end):
-    return jax.tree_map(lambda x: x[start:end], episodes)
+    return jax.tree_util.tree_map(lambda x: x[start:end], episodes)
 
 
 def batch_initial_carry(carry, batch_size):
-    return jax.tree_map(lambda x: jp.repeat(x[None], batch_size, axis=0), carry)
+    return jax.tree_util.tree_map(lambda x: jp.repeat(x[None], batch_size, axis=0), carry)
 
 
 @partial(jax.jit, static_argnames=('hp', 'mfos_input_shape'))
@@ -224,7 +224,7 @@ def generate_mfos_episodes(agent0, agent1, rng, hp, mfos_input_shape):
             xs=(),
             length=inner_episode_length,
         )
-        chunk = jax.tree_map(lambda x: jp.swapaxes(x, 0, 1), chunk)
+        chunk = jax.tree_util.tree_map(lambda x: jp.swapaxes(x, 0, 1), chunk)
         theta0_next = agent0.theta_from_batch_seq({
             'state_seq': chunk['mfos_state'][:, :, 0].reshape(batch_size, inner_episode_length, -1),
         })
@@ -240,13 +240,13 @@ def generate_mfos_episodes(agent0, agent1, rng, hp, mfos_input_shape):
         xs=(),
         length=num_inner_episodes,
     )
-    chunks = jax.tree_map(lambda x: jp.swapaxes(x, 0, 1), outs['chunk'])
+    chunks = jax.tree_util.tree_map(lambda x: jp.swapaxes(x, 0, 1), outs['chunk'])
     theta_metrics = jp.swapaxes(outs['theta'], 0, 1)
 
     def flatten_time(x):
         return x.reshape(batch_size, num_inner_episodes * inner_episode_length, *x.shape[3:])
 
-    flat = jax.tree_map(flatten_time, chunks)
+    flat = jax.tree_util.tree_map(flatten_time, chunks)
     obs = jp.concatenate(
         [
             flat['obs_before'],
@@ -332,7 +332,7 @@ def build_policy_data(episodes, gamma, inner_episode_length, player_id):
 def build_shared_policy_data(episodes, gamma, inner_episode_length):
     data0 = build_policy_data(episodes, gamma, inner_episode_length, 0)
     data1 = build_policy_data(episodes, gamma, inner_episode_length, 1)
-    return jax.tree_map(lambda a, b: jp.concatenate([a, b], axis=0), data0, data1)
+    return jax.tree_util.tree_map(lambda a, b: jp.concatenate([a, b], axis=0), data0, data1)
 
 
 def make_update_mfos_policy_fn(
@@ -398,7 +398,7 @@ def make_update_mfos_policy_fn(
             (agent, opt_state),
             xs=jp.arange(num_epochs),
         )
-        return agent, opt_state, jax.tree_map(lambda x: x.mean(), metrics)
+        return agent, opt_state, jax.tree_util.tree_map(lambda x: x.mean(), metrics)
 
     return update
 
@@ -738,20 +738,7 @@ def main(cfg: DictConfig) -> None:
 
     log_wandb = cfg.wandb.state == 'enabled'
     if log_wandb:
-        wandb_id = wandb.util.generate_id()
-        run_name = get_metrics_csv_filename(hp).removesuffix('.csv')
-        wandb.init(
-            project='loqa-ipd',
-            id=wandb_id,
-            name=run_name,
-            dir=cfg.wandb.wandb_dir,
-            tags=cfg.wandb.tags,
-        )
-        wandb.config.update(hp)
-        wandb.run.log_code('.', include_fn=lambda path: path.endswith('.py'))
-        shutil.make_archive('conf', 'zip', 'conf')
-        wandb.save('conf.zip', policy='now')
-        wandb.run.summary.update(slurm_infos())
+        initialize_wandb(cfg.wandb, hp)
 
     train(hp, log_wandb)
 

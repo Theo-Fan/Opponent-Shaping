@@ -86,7 +86,7 @@ def extract_just_mask(tree, mask):
     return flat_tree[flat_mask == 1]
 
 def flatten_tree(tree):
-    return jp.concatenate(jax.tree_util.tree_leaves(jax.tree_map(lambda x: x.reshape(-1), tree)))
+    return jp.concatenate(jax.tree_util.tree_leaves(jax.tree_util.tree_map(lambda x: x.reshape(-1), tree)))
 
 def melted_dict(d):
     return {'_'.join(k): v for k, v in flax.traverse_util.flatten_dict(d).items()}

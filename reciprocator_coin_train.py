@@ -1,7 +1,6 @@
 import csv
 import os
 import pickle
-import shutil
 import time
 from collections import deque
 from datetime import datetime
@@ -32,12 +31,19 @@ from coin_train import (
     get_num_training_timesteps_per_iteration,
     get_total_training_episodes,
     get_total_training_timesteps,
+    initialize_wandb,
     play_episode_scan_inner_gru,
     scalar_mean,
     tree_concatenate,
 )
-from reciprocator_coin_agent import ConvGRUActorCriticCoinAgent, GRUActorCriticCoinAgent, ScalarPredictor
-from utils import clip_grads_by_norm, global_norm, npify, rscope, slurm_infos
+from reciprocator_coin_agent import (
+    CoinStateValuePredictor,
+    ConvGRUActorCriticCoinAgent,
+    DiscreteTransitionPredictor,
+    GRUActorCriticCoinAgent,
+    ScalarPredictor,
+)
+from utils import clip_grads_by_norm, global_norm, npify, rscope
 
 
 RECIPROCAL_REWARD_TYPES = {
@@ -56,12 +62,13 @@ RECIPROCAL_METRIC_FIELDNAMES = [
     'loss_ppo_value',
     'ppo_entropy',
     'grad_ppo_norm',
+    'loss_voi_state_value',
     'loss_voi_reward',
-    'loss_voi_q',
+    'loss_voi_transition',
     'loss_voi_cf_reward0',
     'loss_voi_cf_reward1',
-    'loss_voi_cf_q0',
-    'loss_voi_cf_q1',
+    'loss_voi_cf_transition0',
+    'loss_voi_cf_transition1',
     'mean_reciprocal_reward_player0',
     'mean_reciprocal_reward_player1',
     'std_reciprocal_reward_player0',
@@ -145,7 +152,6 @@ def build_influence_training_data(episodes, gamma):
     joint_actions = episodes['act']
     joint_rewards = episodes['rew']
     joint_returns = discounted_returns_3d(joint_rewards, gamma)
-    joint_q_values = joint_returns - joint_rewards
 
     batch_size, trace_length = joint_actions.shape[:2]
     states_flat = states.reshape(batch_size, trace_length, -1)
@@ -166,31 +172,31 @@ def build_influence_training_data(episodes, gamma):
         [joint_actions[:, :, 0:1].astype(states.dtype), states_flat, time_remaining],
         axis=-1,
     )
+    transition_labels = states[:, 1:].reshape(batch_size, trace_length - 1, states.shape[2], -1).argmax(axis=-1)
 
     return {
+        'state_inputs': states.reshape(batch_size * trace_length, -1),
         'full_inputs': full_inputs.reshape(batch_size * trace_length, -1),
         'cf_inputs0': cf_inputs0.reshape(batch_size * trace_length, -1),
         'cf_inputs1': cf_inputs1.reshape(batch_size * trace_length, -1),
+        'transition_full_inputs': full_inputs[:, :-1].reshape(batch_size * (trace_length - 1), -1),
+        'transition_cf_inputs0': cf_inputs0[:, :-1].reshape(batch_size * (trace_length - 1), -1),
+        'transition_cf_inputs1': cf_inputs1[:, :-1].reshape(batch_size * (trace_length - 1), -1),
+        'state_value_labels': joint_returns.reshape(batch_size * trace_length, -1),
         'reward_labels': joint_rewards.reshape(batch_size * trace_length, -1),
-        'q_labels': joint_q_values.reshape(batch_size * trace_length, -1),
+        'transition_labels': transition_labels.reshape(batch_size * (trace_length - 1), -1),
     }
 
 
-@jax.jit
-def build_ppo_training_data(episodes, rewards, gamma):
+@partial(jax.jit, static_argnames=('player',))
+def build_ppo_training_data(episodes, rewards, gamma, player):
     batch_size, trace_length = episodes['act'].shape[:2]
-    obs0 = episodes['obs'][:, :-1, 0].reshape(batch_size, trace_length, -1)
-    obs1 = episodes['obs'][:, :-1, 1].reshape(batch_size, trace_length, -1)
-    obs_seq = jp.concatenate([obs0, obs1], axis=0)
-
-    actions0 = episodes['act'][:, :, 0]
-    actions1 = episodes['act'][:, :, 1]
-    action_seq = jp.concatenate([actions0, actions1], axis=0)
+    obs_seq = episodes['obs'][:, :-1, player].reshape(batch_size, trace_length, -1)
+    action_seq = episodes['act'][:, :, player]
 
     taken_logps = jp.take_along_axis(episodes['logp'], episodes['act'][..., None], axis=-1)[..., 0]
-    old_logp_seq = jp.concatenate([taken_logps[:, :, 0], taken_logps[:, :, 1]], axis=0)
-
-    reward_seq = jp.concatenate([rewards[:, :, 0], rewards[:, :, 1]], axis=0)
+    old_logp_seq = taken_logps[:, :, player]
+    reward_seq = rewards[:, :, player]
     return_seq = discounted_returns_2d(reward_seq, gamma)
     return_seq = (return_seq - return_seq.mean()) / (return_seq.std() + 1e-5)
 
@@ -203,7 +209,7 @@ def build_ppo_training_data(episodes, rewards, gamma):
 
 
 @partial(jax.jit, static_argnames=('hp',))
-def generate_selfplay_episodes(agent, carries, rng, hp):
+def generate_selfplay_episodes(agent0, agent1, carries, rng, hp):
     rngs = rax.split(rscope(rng, 'reciprocator_gen_episode'), hp['batch_size'])
     init_envs, _ = jax.vmap(lambda r: CoinGame.init(
         rng=r,
@@ -213,8 +219,8 @@ def generate_selfplay_episodes(agent, carries, rng, hp):
     def play_one_episode(play_rng, env):
         return play_episode_scan_inner_gru(
             dict(
-                agent0=agent,
-                agent1=agent,
+                agent0=agent0,
+                agent1=agent1,
                 rng=play_rng,
                 t=0,
                 **carries,
@@ -257,10 +263,40 @@ def make_predictor_train_fn(model, optimizer, batch_size, num_steps):
     return train
 
 
-def make_update_shared_policy_fn(optimizer, gamma, eps_clip, entropy_weight, num_epochs, clip_grad_norm):
+def make_classifier_train_fn(model, optimizer, batch_size, num_steps):
+    @jax.jit
+    def train(params, opt_state, rng, inputs, labels):
+        num_samples = inputs.shape[0]
+
+        def loss_fn(p, x, y):
+            logp = model.apply(p, x)
+            return -jp.take_along_axis(logp, y[..., None], axis=-1)[..., 0].mean()
+
+        def body(carry, _):
+            p, state, step_rng = carry
+            step_rng, sample_rng = rax.split(step_rng)
+            indices = rax.randint(sample_rng, shape=(batch_size,), minval=0, maxval=num_samples)
+            x_batch = inputs[indices]
+            y_batch = labels[indices]
+            loss, grads = jax.value_and_grad(loss_fn)(p, x_batch, y_batch)
+            updates, state = optimizer.update(grads, state, p)
+            p = optax.apply_updates(p, updates)
+            return (p, state, step_rng), loss
+
+        (params, opt_state, rng), losses = jax.lax.scan(
+            body,
+            (params, opt_state, rng),
+            xs=jp.arange(num_steps),
+        )
+        return params, opt_state, {'loss': losses.mean()}
+
+    return train
+
+
+def make_update_policy_fn(optimizer, gamma, eps_clip, entropy_weight, num_epochs, clip_grad_norm, player):
     @jax.jit
     def update(agent, opt_state, episodes, rewards):
-        data = build_ppo_training_data(episodes, rewards, gamma)
+        data = build_ppo_training_data(episodes, rewards, gamma, player)
 
         def loss_fn(a):
             outputs = jax.vmap(lambda obs: a.call_seq({'obs_seq': obs}))(data['obs_seq'])
@@ -305,13 +341,21 @@ def make_update_shared_policy_fn(optimizer, gamma, eps_clip, entropy_weight, num
             (agent, opt_state),
             xs=jp.arange(num_epochs),
         )
-        metrics = jax.tree_map(lambda x: x.mean(), metrics)
+        metrics = jax.tree_util.tree_map(lambda x: x.mean(), metrics)
         return agent, opt_state, metrics
 
     return update
 
 
-def make_compute_reciprocal_reward_fn(full_model, cf_model, reward_type, normalize_reciprocal_reward):
+def make_compute_reciprocal_reward_fn(
+        scalar_model,
+        transition_model,
+        state_value_model,
+        possible_states,
+        num_transition_classes,
+        reward_type,
+        normalize_reciprocal_reward,
+):
     if reward_type not in RECIPROCAL_REWARD_TYPES:
         raise ValueError(f'Unknown reciprocal reward type {reward_type}')
 
@@ -319,15 +363,37 @@ def make_compute_reciprocal_reward_fn(full_model, cf_model, reward_type, normali
     def compute(params, episodes, gamma):
         data = build_influence_training_data(episodes, gamma)
         batch_size, trace_length = episodes['rew'].shape[:2]
-        full_reward = full_model.apply(params['reward'], data['full_inputs'])
-        full_q = full_model.apply(params['q'], data['full_inputs'])
+        full_reward = scalar_model.apply(params['reward'], data['full_inputs'])
+        full_transition_logp = transition_model.apply(params['transition'], data['full_inputs'])
         cf_inputs = (data['cf_inputs0'], data['cf_inputs1'])
+        state_values = state_value_model.apply(params['state_value'], possible_states)
+        state_values = state_values.reshape((num_transition_classes,) * 4 + (2,))
+
+        def expected_transition_value(transition_logp):
+            probs = jp.exp(transition_logp)
+            return jp.einsum(
+                'na,nb,nc,nd,abcdp->np',
+                probs[:, 0],
+                probs[:, 1],
+                probs[:, 2],
+                probs[:, 3],
+                state_values,
+                optimize='optimal',
+            )
+
+        full_transition_value = expected_transition_value(full_transition_logp)
 
         def voi(influencer_idx, influenced_idx):
-            cf_reward = cf_model.apply(params[f'cf_reward{influencer_idx}'], cf_inputs[influencer_idx])
-            cf_q = cf_model.apply(params[f'cf_q{influencer_idx}'], cf_inputs[influencer_idx])
+            cf_reward = scalar_model.apply(params[f'cf_reward{influencer_idx}'], cf_inputs[influencer_idx])
+            cf_transition_logp = transition_model.apply(
+                params[f'cf_transition{influencer_idx}'],
+                cf_inputs[influencer_idx],
+            )
             reward_influence = full_reward[:, influenced_idx] - cf_reward[:, influenced_idx]
-            future_influence = full_q[:, influenced_idx] - cf_q[:, influenced_idx]
+            future_influence = (
+                full_transition_value[:, influenced_idx]
+                - expected_transition_value(cf_transition_logp)[:, influenced_idx]
+            )
             return (reward_influence + gamma * future_influence).reshape(batch_size, trace_length)
 
         voi_0_on_1 = voi(0, 1)
@@ -465,44 +531,78 @@ def append_reciprocator_metric_row(csv_path, row):
         writer.writerow(full_row)
 
 
-def initialize_value_of_influence(rng, obs_dim, hp):
+def make_possible_coin_states(obs_shape):
+    num_channels, height, width = obs_shape
+    num_classes = height * width
+    labels = jp.stack(
+        jp.meshgrid(*[jp.arange(num_classes)] * num_channels, indexing='ij'),
+        axis=-1,
+    ).reshape(-1, num_channels)
+    return jax.nn.one_hot(labels, num_classes).reshape(-1, num_channels, height, width)
+
+
+def initialize_value_of_influence(rng, obs_shape, hp):
     influence_hp = hp['reciprocator']['influence']
     hidden_size = int(influence_hp['hidden_size'])
-    full_model = ScalarPredictor(hidden_size=hidden_size, output_size=2)
-    cf_model = ScalarPredictor(hidden_size=hidden_size, output_size=2)
+    num_channels, height, width = obs_shape
+    num_transition_classes = height * width
+    scalar_model = ScalarPredictor(hidden_size=hidden_size, output_size=2)
+    transition_model = DiscreteTransitionPredictor(
+        hidden_size=hidden_size,
+        num_channels=num_channels,
+        num_classes=num_transition_classes,
+    )
+    state_value_model = CoinStateValuePredictor(
+        obs_shape=obs_shape,
+        hidden_size=hidden_size,
+        out_channels=max(1, hidden_size // 4),
+        output_size=2,
+    )
+    obs_dim = int(np.prod(obs_shape))
     full_input_dim = 2 + obs_dim + 1
     cf_input_dim = 1 + obs_dim + 1
 
-    rngs = rax.split(rng, 7)
+    rngs = rax.split(rng, 8)
+    dummy_state = jp.zeros((1, obs_dim), dtype=jp.float32)
     dummy_full = jp.zeros((1, full_input_dim), dtype=jp.float32)
     dummy_cf = jp.zeros((1, cf_input_dim), dtype=jp.float32)
     params = {
-        'reward': full_model.init(rngs[0], dummy_full),
-        'q': full_model.init(rngs[1], dummy_full),
-        'cf_reward0': cf_model.init(rngs[2], dummy_cf),
-        'cf_reward1': cf_model.init(rngs[3], dummy_cf),
-        'cf_q0': cf_model.init(rngs[4], dummy_cf),
-        'cf_q1': cf_model.init(rngs[5], dummy_cf),
+        'state_value': state_value_model.init(rngs[0], dummy_state),
+        'reward': scalar_model.init(rngs[1], dummy_full),
+        'transition': transition_model.init(rngs[2], dummy_full),
+        'cf_reward0': scalar_model.init(rngs[3], dummy_cf),
+        'cf_reward1': scalar_model.init(rngs[4], dummy_cf),
+        'cf_transition0': transition_model.init(rngs[5], dummy_cf),
+        'cf_transition1': transition_model.init(rngs[6], dummy_cf),
     }
 
     optimizer = optax.adam(float(influence_hp['lr']))
     opt_states = {name: optimizer.init(param) for name, param in params.items()}
     num_steps = int(influence_hp['target_epochs']) * int(influence_hp['num_train_batches'])
-    full_train_fn = make_predictor_train_fn(
-        full_model,
+    scalar_train_fn = make_predictor_train_fn(
+        scalar_model,
         optimizer,
         int(influence_hp['target_batch_size']),
         num_steps,
     )
-    cf_train_fn = make_predictor_train_fn(
-        cf_model,
+    state_value_train_fn = make_predictor_train_fn(
+        state_value_model,
+        optimizer,
+        int(influence_hp['target_batch_size']),
+        num_steps,
+    )
+    transition_train_fn = make_classifier_train_fn(
+        transition_model,
         optimizer,
         int(influence_hp['target_batch_size']),
         num_steps,
     )
     compute_reciprocal_reward = make_compute_reciprocal_reward_fn(
-        full_model,
-        cf_model,
+        scalar_model,
+        transition_model,
+        state_value_model,
+        make_possible_coin_states(obs_shape),
+        num_transition_classes,
         hp['reciprocator']['reciprocal_reward_type'],
         bool(hp['reciprocator']['normalize_reciprocal_reward']),
     )
@@ -510,8 +610,9 @@ def initialize_value_of_influence(rng, obs_dim, hp):
         'params': params,
         'opt_states': opt_states,
         'optimizer': optimizer,
-        'full_train_fn': full_train_fn,
-        'cf_train_fn': cf_train_fn,
+        'scalar_train_fn': scalar_train_fn,
+        'state_value_train_fn': state_value_train_fn,
+        'transition_train_fn': transition_train_fn,
         'compute_reciprocal_reward': compute_reciprocal_reward,
     }
 
@@ -520,60 +621,68 @@ def train_value_of_influence(voi_state, episodes, rng, gamma):
     data = build_influence_training_data(episodes, gamma)
     params = dict(voi_state['params'])
     opt_states = dict(voi_state['opt_states'])
-    rngs = rax.split(rng, 6)
+    rngs = rax.split(rng, 7)
 
-    params['reward'], opt_states['reward'], reward_loss = voi_state['full_train_fn'](
+    params['state_value'], opt_states['state_value'], state_value_loss = voi_state['state_value_train_fn'](
+        params['state_value'],
+        opt_states['state_value'],
+        rngs[0],
+        data['state_inputs'],
+        data['state_value_labels'],
+    )
+    params['reward'], opt_states['reward'], reward_loss = voi_state['scalar_train_fn'](
         params['reward'],
         opt_states['reward'],
-        rngs[0],
-        data['full_inputs'],
-        data['reward_labels'],
-    )
-    params['q'], opt_states['q'], q_loss = voi_state['full_train_fn'](
-        params['q'],
-        opt_states['q'],
         rngs[1],
         data['full_inputs'],
-        data['q_labels'],
+        data['reward_labels'],
     )
-    params['cf_reward0'], opt_states['cf_reward0'], cf_reward0_loss = voi_state['cf_train_fn'](
+    params['transition'], opt_states['transition'], transition_loss = voi_state['transition_train_fn'](
+        params['transition'],
+        opt_states['transition'],
+        rngs[2],
+        data['transition_full_inputs'],
+        data['transition_labels'],
+    )
+    params['cf_reward0'], opt_states['cf_reward0'], cf_reward0_loss = voi_state['scalar_train_fn'](
         params['cf_reward0'],
         opt_states['cf_reward0'],
-        rngs[2],
+        rngs[3],
         data['cf_inputs0'],
         data['reward_labels'],
     )
-    params['cf_reward1'], opt_states['cf_reward1'], cf_reward1_loss = voi_state['cf_train_fn'](
+    params['cf_reward1'], opt_states['cf_reward1'], cf_reward1_loss = voi_state['scalar_train_fn'](
         params['cf_reward1'],
         opt_states['cf_reward1'],
-        rngs[3],
+        rngs[4],
         data['cf_inputs1'],
         data['reward_labels'],
     )
-    params['cf_q0'], opt_states['cf_q0'], cf_q0_loss = voi_state['cf_train_fn'](
-        params['cf_q0'],
-        opt_states['cf_q0'],
-        rngs[4],
-        data['cf_inputs0'],
-        data['q_labels'],
-    )
-    params['cf_q1'], opt_states['cf_q1'], cf_q1_loss = voi_state['cf_train_fn'](
-        params['cf_q1'],
-        opt_states['cf_q1'],
+    params['cf_transition0'], opt_states['cf_transition0'], cf_transition0_loss = voi_state['transition_train_fn'](
+        params['cf_transition0'],
+        opt_states['cf_transition0'],
         rngs[5],
-        data['cf_inputs1'],
-        data['q_labels'],
+        data['transition_cf_inputs0'],
+        data['transition_labels'],
+    )
+    params['cf_transition1'], opt_states['cf_transition1'], cf_transition1_loss = voi_state['transition_train_fn'](
+        params['cf_transition1'],
+        opt_states['cf_transition1'],
+        rngs[6],
+        data['transition_cf_inputs1'],
+        data['transition_labels'],
     )
 
     voi_state['params'] = params
     voi_state['opt_states'] = opt_states
     metrics = {
+        'loss_voi_state_value': state_value_loss['loss'],
         'loss_voi_reward': reward_loss['loss'],
-        'loss_voi_q': q_loss['loss'],
+        'loss_voi_transition': transition_loss['loss'],
         'loss_voi_cf_reward0': cf_reward0_loss['loss'],
         'loss_voi_cf_reward1': cf_reward1_loss['loss'],
-        'loss_voi_cf_q0': cf_q0_loss['loss'],
-        'loss_voi_cf_q1': cf_q1_loss['loss'],
+        'loss_voi_cf_transition0': cf_transition0_loss['loss'],
+        'loss_voi_cf_transition1': cf_transition1_loss['loss'],
     }
     return metrics
 
@@ -585,7 +694,7 @@ def set_up_state_from_config(hp):
     )
     dummy_episode = make_zero_episode(trace_length=hp['game']['game_length'], coin_game=dummy_env)
     dummy_obs_seq = dummy_episode['obs'][:, 0].reshape(dummy_episode['obs'].shape[0], -1)
-    rng, agent_rng, voi_rng = rax.split(rax.PRNGKey(hp['seed']), 3)
+    rng, agent0_rng, agent1_rng, voi_rng = rax.split(rax.PRNGKey(hp['seed']), 4)
 
     policy_hp = hp['reciprocator']['policy']
     policy_model = policy_hp.get('model', 'conv_gru')
@@ -609,37 +718,54 @@ def set_up_state_from_config(hp):
         )
     else:
         raise ValueError(f'Unknown Reciprocator policy model {policy_model}')
-    agent_params = agent_module.init(agent_rng, {'obs_seq': dummy_obs_seq, 'rng': rax.PRNGKey(0), 't': 0})
-    agent = CoinAgent(params=agent_params, model=agent_module, player=0)
+    agent0_params = agent_module.init(agent0_rng, {'obs_seq': dummy_obs_seq, 'rng': rax.PRNGKey(0), 't': 0})
+    agent1_params = agent_module.init(agent1_rng, {'obs_seq': dummy_obs_seq, 'rng': rax.PRNGKey(1), 't': 0})
+    agent0 = CoinAgent(params=agent0_params, model=agent_module, player=0)
+    agent1 = CoinAgent(params=agent1_params, model=agent_module, player=1)
     policy_optimizer = optax.adam(float(policy_hp['lr']))
-    agent_opt = Optimizer(policy_optimizer, policy_optimizer.init(agent))
+    agent0_opt = Optimizer(policy_optimizer, policy_optimizer.init(agent0))
+    agent1_opt = Optimizer(policy_optimizer, policy_optimizer.init(agent1))
 
-    carries0 = agent.get_initial_carries()
+    carries0 = agent0.get_initial_carries()
+    carries1 = agent1.get_initial_carries()
     carries = {
         'c_0_actor': carries0['carry_actor'],
         'c_0_qvalue': carries0['carry_qvalue'],
-        'c_1_actor': carries0['carry_actor'],
-        'c_1_qvalue': carries0['carry_qvalue'],
+        'c_1_actor': carries1['carry_actor'],
+        'c_1_qvalue': carries1['carry_qvalue'],
     }
     voi_state = initialize_value_of_influence(
         voi_rng,
-        int(np.prod(dummy_env.OBS_SHAPE)),
+        tuple(dummy_env.OBS_SHAPE),
         hp,
     )
-    update_policy = make_update_shared_policy_fn(
+    update_policy0 = make_update_policy_fn(
         policy_optimizer,
         float(hp['reward_discount']),
         float(policy_hp['eps_clip']),
         float(policy_hp['entropy_weight']),
         int(policy_hp['ppo_epochs']),
         float(policy_hp['clip_grad_norm']) if 'clip_grad_norm' in policy_hp else None,
+        player=0,
+    )
+    update_policy1 = make_update_policy_fn(
+        policy_optimizer,
+        float(hp['reward_discount']),
+        float(policy_hp['eps_clip']),
+        float(policy_hp['entropy_weight']),
+        int(policy_hp['ppo_epochs']),
+        float(policy_hp['clip_grad_norm']) if 'clip_grad_norm' in policy_hp else None,
+        player=1,
     )
     state = {
         'rng': rng,
-        'agent': agent,
-        'agent_opt': agent_opt,
+        'agent0': agent0,
+        'agent1': agent1,
+        'agent0_opt': agent0_opt,
+        'agent1_opt': agent1_opt,
         'voi': voi_state,
-        'update_policy': update_policy,
+        'update_policy0': update_policy0,
+        'update_policy1': update_policy1,
     }
     return state, carries
 
@@ -669,6 +795,18 @@ def validate_reciprocator_config(hp):
         raise ValueError('This Reciprocator entry is intended for the same 3x3 Coin Game setting as LOQA self-play.')
     if hp['game']['game_length'] != 200:
         raise ValueError('This Reciprocator entry expects 200 steps per episode, matching the LOQA self-play setup.')
+    if int(hp['seed']) < 0:
+        raise ValueError('hp.seed must be a non-negative integer.')
+    if get_total_training_timesteps(hp) == 30_000_000 and get_expected_metrics_csv_rows(hp) != 7500:
+        raise ValueError('A 3e7-timestep Reciprocator run must be configured to write exactly 7500 CSV rows.')
+
+
+def get_expected_metrics_csv_rows(hp):
+    num_training_iterations = get_num_training_iterations(hp)
+    timesteps_per_iteration = get_num_training_timesteps_per_iteration(hp)
+    metrics_log_timestep_freq = get_metrics_log_timestep_freq(hp)
+    iterations_per_row = (metrics_log_timestep_freq + timesteps_per_iteration - 1) // timesteps_per_iteration
+    return (num_training_iterations + iterations_per_row - 1) // iterations_per_row
 
 
 def slim_episode_for_influence(episodes):
@@ -702,6 +840,7 @@ def train(hp, log_wandb):
     print(f'total training episodes: {total_training_episodes}')
     print(f'total training timesteps: {total_training_timesteps}')
     print(f'metrics log timestep frequency: {metrics_log_timestep_freq}')
+    print(f'expected metrics csv rows: {get_expected_metrics_csv_rows(hp)}')
 
     iteration_metrics_csv_path = init_reciprocator_metrics_csv(save_path, hp)
     print(f'metrics csv path: {iteration_metrics_csv_path}')
@@ -724,7 +863,7 @@ def train(hp, log_wandb):
 
     for i in range(num_training_iterations):
         state['rng'], rng = rax.split(state['rng'])
-        episodes = generate_selfplay_episodes(state['agent'], carries, rng, hp)
+        episodes = generate_selfplay_episodes(state['agent0'], state['agent1'], carries, rng, hp)
         target_buffer.append(slim_episode_for_influence(episodes))
         metric_window_batches.append(episodes)
 
@@ -756,14 +895,23 @@ def train(hp, log_wandb):
         update_metric_row.update({key: scalar_mean(value) for key, value in diagnostic_metrics.items()})
 
         if should_update_policy(i, hp):
-            new_agent, new_opt_state, ppo_metrics = state['update_policy'](
-                state['agent'],
-                state['agent_opt'].opt_state,
+            new_agent0, new_opt_state0, ppo_metrics0 = state['update_policy0'](
+                state['agent0'],
+                state['agent0_opt'].opt_state,
                 episodes,
                 total_rewards,
             )
-            state['agent'] = new_agent
-            state['agent_opt'] = state['agent_opt'].replace(opt_state=new_opt_state)
+            new_agent1, new_opt_state1, ppo_metrics1 = state['update_policy1'](
+                state['agent1'],
+                state['agent1_opt'].opt_state,
+                episodes,
+                total_rewards,
+            )
+            state['agent0'] = new_agent0
+            state['agent1'] = new_agent1
+            state['agent0_opt'] = state['agent0_opt'].replace(opt_state=new_opt_state0)
+            state['agent1_opt'] = state['agent1_opt'].replace(opt_state=new_opt_state1)
+            ppo_metrics = jax.tree_util.tree_map(lambda x, y: (x + y) / 2, ppo_metrics0, ppo_metrics1)
             update_metric_row.update({key: scalar_mean(value) for key, value in ppo_metrics.items()})
 
         completed_episodes += episodes_per_iteration
@@ -816,7 +964,8 @@ def train(hp, log_wandb):
 
         if i % hp['save_every'] == 0:
             minimal_state = {
-                'agent': npify(state['agent']),
+                'agent0': npify(state['agent0']),
+                'agent1': npify(state['agent1']),
                 'voi_params': npify(state['voi']['params']),
                 'hp': hp,
             }
@@ -834,20 +983,7 @@ def main(cfg: DictConfig) -> None:
 
     log_wandb = cfg.wandb.state == 'enabled'
     if log_wandb:
-        wandb_id = wandb.util.generate_id()
-        run_name = get_metrics_csv_filename(hp).removesuffix('.csv')
-        wandb.init(
-            project='loqa-ipd',
-            id=wandb_id,
-            name=run_name,
-            dir=cfg.wandb.wandb_dir,
-            tags=cfg.wandb.tags,
-        )
-        wandb.config.update(hp)
-        wandb.run.log_code('.', include_fn=lambda path: path.endswith('.py'))
-        shutil.make_archive('conf', 'zip', 'conf')
-        wandb.save('conf.zip', policy='now')
-        wandb.run.summary.update(slurm_infos())
+        initialize_wandb(cfg.wandb, hp)
 
     train(hp, log_wandb)
 

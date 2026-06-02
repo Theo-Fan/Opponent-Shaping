@@ -259,7 +259,7 @@ class AgentParameters:
 
     def get_action(self, rng, episode, t, *args, **kwargs):
         hiddens = self.observe(episode)
-        hiddens_t = jax.tree_map(lambda x: x[t], hiddens)
+        hiddens_t = jax.tree_util.tree_map(lambda x: x[t], hiddens)
         action = self.emit(hiddens_t, rng)
         return action
 
@@ -429,10 +429,10 @@ def get_new_distances(episode, t, hp, rng, distance_of_this_player):
     new_distances = jax.vmap(lambda a: get_new_distance(a))(jp.arange(hp['g_num_actions']))
     shuffle_rng = rax.split(rng, 1)[0]
     # shuffle new_distances
-    shuffled_distances = jax.tree_map(lambda x: rax.shuffle(shuffle_rng, x, axis=0), new_distances)
+    shuffled_distances = jax.tree_util.tree_map(lambda x: rax.shuffle(shuffle_rng, x, axis=0), new_distances)
     # now sort by new distance
     indices = jp.argsort(shuffled_distances['new_distance'])
-    sorted_distances = jax.tree_map(lambda x: x[indices], shuffled_distances)
+    sorted_distances = jax.tree_util.tree_map(lambda x: x[indices], shuffled_distances)
     return {'new_distances': new_distances, 'sorted_distances': sorted_distances}
 
 
@@ -490,12 +490,12 @@ def test_replay_buffer_agent():
 
     agent_rb = [agent.params for _ in range(16)]
     # concatenate all params
-    agent_rb = jax.tree_map(lambda *args: jp.concatenate(args, axis=0), *agent_rb)
+    agent_rb = jax.tree_util.tree_map(lambda *args: jp.concatenate(args, axis=0), *agent_rb)
     # sample 8 params
     agent_indices = jax.random.randint(rax.PRNGKey(0), shape=(8,), minval=0, maxval=16)
-    agent_rb = jax.tree_map(lambda x: x[agent_indices], agent_rb)
+    agent_rb = jax.tree_util.tree_map(lambda x: x[agent_indices], agent_rb)
     # print agent_rb structure
-    print(jax.tree_map(lambda x: x.shape, agent_rb))
+    print(jax.tree_util.tree_map(lambda x: x.shape, agent_rb))
 
 
 

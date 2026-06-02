@@ -23,9 +23,13 @@ hp:
 
 wandb:
   state: disabled
+  project: memory_sweep
+  group: coingame_selfplay
+  run_name: self-play_{algorithm}_seed{seed}
+  mode: online
   tags:
     - test
-  wandb_dir: /scratch/jduque/wandb
+  wandb_dir: ./wandb
 jax:
   jax_disable_jit: False
   jax_debug_nans: False

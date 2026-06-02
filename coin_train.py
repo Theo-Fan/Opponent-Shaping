@@ -34,12 +34,12 @@ class Optimizer:
 
 @jax.jit
 def tree_stack(xs):
-    return jax.tree_map(lambda *args: jp.stack(args), *xs)
+    return jax.tree_util.tree_map(lambda *args: jp.stack(args), *xs)
 
 
 @partial(jax.jit, static_argnames=('B',))
 def tree_unstack(xs, B):
-    episodes = [jax.tree_map(lambda x: x[i], xs) for i in range(B)]
+    episodes = [jax.tree_util.tree_map(lambda x: x[i], xs) for i in range(B)]
     return episodes
 
 
@@ -180,8 +180,8 @@ def namespaced_wandb_key(key):
 
     if key.startswith('loss_mfos_'):
         return f'mfos/{key.removeprefix("loss_mfos_")}'
-    if key == 'mfos_entropy':
-        return 'mfos/entropy'
+    if key.startswith('mfos_'):
+        return f'mfos/{key.removeprefix("mfos_")}'
     if key == 'grad_mfos_norm':
         return 'mfos/grad_norm'
     if key.startswith('theta_'):
@@ -212,6 +212,32 @@ def format_wandb_metrics(row):
             float(row['avg_episode_return_player0'] + row['avg_episode_return_player1']) / 2
         )
     return formatted
+
+
+def get_wandb_run_name(hp, wandb_cfg):
+    algorithm = str(hp['agent_0']).upper()
+    template = wandb_cfg.get('run_name') or 'self-play_{algorithm}_seed{seed}'
+    return str(template).format(algorithm=algorithm, seed=int(hp['seed']))
+
+
+def initialize_wandb(wandb_cfg, hp):
+    wandb_id = wandb.util.generate_id()
+    wandb.init(
+        project=str(wandb_cfg.project),
+        group=str(wandb_cfg.group),
+        name=get_wandb_run_name(hp, wandb_cfg),
+        mode=str(wandb_cfg.mode),
+        id=wandb_id,
+        dir=str(wandb_cfg.wandb_dir),
+        tags=list(wandb_cfg.tags),
+        config=hp,
+    )
+    wandb.define_metric('global/timestep')
+    wandb.define_metric('*', step_metric='global/timestep')
+    wandb.run.log_code('.', include_fn=lambda path: path.endswith('.py'))
+    shutil.make_archive('conf', 'zip', 'conf')
+    wandb.save('conf.zip', policy='now')
+    wandb.run.summary.update(slurm_infos())
 
 
 def get_num_training_episodes_per_iteration(hp):
@@ -288,7 +314,7 @@ def get_metrics_log_timestep_freq(hp):
 def tree_concatenate(xs):
     if len(xs) == 1:
         return xs[0]
-    return jax.tree_map(lambda *args: jp.concatenate(args, axis=0), *xs)
+    return jax.tree_util.tree_map(lambda *args: jp.concatenate(args, axis=0), *xs)
 
 
 def scalar_mean(value):
@@ -470,7 +496,7 @@ def set_up_state_from_config(hp):
     def create_rb_agent_params(player_id: int):
         rb_size = hp['agent_replay_buffer']['capacity']
         tmp_rb = [state[f'agent{player_id}'].params for _ in range(rb_size)]
-        state[f'rb_agent{player_id}_params'] = jax.tree_map(lambda *xs: jp.stack(xs, axis=0), *tmp_rb)
+        state[f'rb_agent{player_id}_params'] = jax.tree_util.tree_map(lambda *xs: jp.stack(xs, axis=0), *tmp_rb)
         state['min_valid_index_rb'] = rb_size  # first, the buffer is not valid
 
     if use_rb(hp):
@@ -564,9 +590,9 @@ def sample_agent_params(hp, rb, agent, rb_rng, min_valid_index: int):
     sample_size = B - cur_agent_size
 
     agent_indices = jax.random.randint(rb_rng, shape=(sample_size,), minval=min_valid_index, maxval=rb_size)
-    sample_params = jax.tree_map(lambda x: x[agent_indices], rb)
+    sample_params = jax.tree_util.tree_map(lambda x: x[agent_indices], rb)
     agent_params = jax.vmap(lambda i: agent.params)(jp.arange(cur_agent_size))
-    final_agent_params = jax.tree_map(lambda *xs: jp.concatenate(xs, axis=0), sample_params, agent_params)
+    final_agent_params = jax.tree_util.tree_map(lambda *xs: jp.concatenate(xs, axis=0), sample_params, agent_params)
 
     return final_agent_params
 
@@ -841,9 +867,9 @@ def train(hp, log_wandb):
 
 @jax.jit
 def push_to_rb(rb, params):
-    to_keep_rb = jax.tree_map(lambda x: x[1:], rb)
-    params = jax.tree_map(lambda x: x[None], params)
-    new_rb = jax.tree_map(lambda x, y: jp.concatenate((x, y), axis=0), to_keep_rb, params)
+    to_keep_rb = jax.tree_util.tree_map(lambda x: x[1:], rb)
+    params = jax.tree_util.tree_map(lambda x: x[None], params)
+    new_rb = jax.tree_util.tree_map(lambda x, y: jp.concatenate((x, y), axis=0), to_keep_rb, params)
     return new_rb
 
 
@@ -918,7 +944,7 @@ def play_episode_scan_inner_gru(inp, trace_length, env):
         aux = {}
         env, rng, episode, t, c_0_actor, c_0_qvalue, c_1_actor, c_1_qvalue = carry
         rng, rng0, rng1 = rax.split(rng, 3)
-        episode['games'] = jax.tree_map(lambda x, o: x.at[t].set(o), episode['games'], env)
+        episode['games'] = jax.tree_util.tree_map(lambda x, o: x.at[t].set(o), episode['games'], env)
         prev_obs_0 = episode['obs'][t, 0].reshape(-1)
         prev_obs_1 = episode['obs'][t, 1].reshape(-1)
         out1 = agent0.call_step({'obs': prev_obs_0, 'rng': rng0, 't': t, 'carry_actor': c_0_actor, 'carry_qvalue': c_0_qvalue})
@@ -947,7 +973,7 @@ def play_episode_scan_inner_gru(inp, trace_length, env):
 
     (env, rng, episode, _, _, _, _, _), aux = jax.lax.scan(f=body_fn, init=(env, rng, episode, 0, c_0_actor, c_0_qvalue, c_1_actor, c_1_qvalue), xs=(), length=trace_length)
     last_game = env
-    episode['games'] = jax.tree_map(lambda x, o: x.at[trace_length].set(o), episode['games'], last_game)
+    episode['games'] = jax.tree_util.tree_map(lambda x, o: x.at[trace_length].set(o), episode['games'], last_game)
     return episode, aux
 
 
@@ -971,7 +997,7 @@ def train_agent_qvalue(state, hp, episodes, player_to_train: int):
     new_agent = aux['agent']
     state[f'agent{player_to_train}'] = new_agent
     ema_gamma = hp['qvalue']['train']['target_ema_gamma']
-    agent_ema_params = jax.tree_map(lambda old, new: ema_gamma * old + (1 - ema_gamma) * new, agent_ema.params, new_agent.params)
+    agent_ema_params = jax.tree_util.tree_map(lambda old, new: ema_gamma * old + (1 - ema_gamma) * new, agent_ema.params, new_agent.params)
     state[f'agent{player_to_train}_ema'] = agent_ema.replace(params=agent_ema_params)
     state[f'agent{player_to_train}_opt_qvalue'] = agent_opt.replace(opt_state=aux['new_opt_state'])
     return aux
@@ -1240,8 +1266,8 @@ def update_agent_actor(agent, opponents, optimizers, hp, episodes, player_to_tra
         return jp.stack([loss_agent, loss_opponent]), aux
 
     grads, aux = jax.jacobian(loss_fn, has_aux=True)(agent)
-    grad_agent = jax.tree_map(lambda x: x[0], grads)
-    grad_opponent = jax.tree_map(lambda x: x[1], grads)
+    grad_agent = jax.tree_util.tree_map(lambda x: x[0], grads)
+    grad_opponent = jax.tree_util.tree_map(lambda x: x[1], grads)
 
     def clip_grad(g):
         clip_grad_config = hp['actor']['train']['clip_grad']
@@ -1257,7 +1283,7 @@ def update_agent_actor(agent, opponents, optimizers, hp, episodes, player_to_tra
     if hp['actor']['train']['separate'] == 'disabled':
         opt_loss = optimizers['opt_loss']
         if include_opponent:
-            grad = jax.tree_map(lambda a, b: a + hp['opponent_differentiation_weight'] * b, grad_agent, grad_opponent)
+            grad = jax.tree_util.tree_map(lambda a, b: a + hp['opponent_differentiation_weight'] * b, grad_agent, grad_opponent)
         else:
             grad = grad_agent
 
@@ -1343,14 +1369,7 @@ def main(cfg: DictConfig) -> None:
 
     log_wandb = cfg.wandb.state == 'enabled'
     if log_wandb:
-        wandb_id = wandb.util.generate_id()
-        wandb.init(project="loqa-ipd", id=wandb_id, dir=cfg.wandb.wandb_dir, tags=cfg.wandb.tags)
-        wandb.config.update(hp)
-        wandb.run.log_code(".", include_fn=lambda path: path.endswith(".py"))
-
-        shutil.make_archive('conf', 'zip', 'conf')
-        wandb.save('conf.zip', policy='now')
-        wandb.run.summary.update(slurm_infos())
+        initialize_wandb(cfg.wandb, hp)
 
     train(hp, log_wandb)
 
