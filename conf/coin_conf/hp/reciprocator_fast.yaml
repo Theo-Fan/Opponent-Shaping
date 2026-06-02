@@ -1,0 +1,9 @@
+defaults:
+  - reciprocator
+  - _self_
+
+# Keep the full influence-estimator budget while using a less aggressive PPO
+# update schedule. This is the recommended profile for faster experiments.
+reciprocator:
+  policy:
+    ppo_epochs: 16

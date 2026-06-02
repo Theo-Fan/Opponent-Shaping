@@ -382,24 +382,36 @@ def make_compute_reciprocal_reward_fn(
             )
 
         full_transition_value = expected_transition_value(full_transition_logp)
+        cf_rewards = tuple(
+            scalar_model.apply(params[f'cf_reward{influencer_idx}'], cf_inputs[influencer_idx])
+            for influencer_idx in range(2)
+        )
+        cf_transition_values = tuple(
+            expected_transition_value(
+                transition_model.apply(
+                    params[f'cf_transition{influencer_idx}'],
+                    cf_inputs[influencer_idx],
+                )
+            )
+            for influencer_idx in range(2)
+        )
 
         def voi(influencer_idx, influenced_idx):
-            cf_reward = scalar_model.apply(params[f'cf_reward{influencer_idx}'], cf_inputs[influencer_idx])
-            cf_transition_logp = transition_model.apply(
-                params[f'cf_transition{influencer_idx}'],
-                cf_inputs[influencer_idx],
-            )
-            reward_influence = full_reward[:, influenced_idx] - cf_reward[:, influenced_idx]
+            reward_influence = full_reward[:, influenced_idx] - cf_rewards[influencer_idx][:, influenced_idx]
             future_influence = (
                 full_transition_value[:, influenced_idx]
-                - expected_transition_value(cf_transition_logp)[:, influenced_idx]
+                - cf_transition_values[influencer_idx][:, influenced_idx]
             )
             return (reward_influence + gamma * future_influence).reshape(batch_size, trace_length)
 
         voi_0_on_1 = voi(0, 1)
         voi_1_on_0 = voi(1, 0)
-        voi_0_on_0 = voi(0, 0)
-        voi_1_on_1 = voi(1, 1)
+        if reward_type in ('grudge_minus_debit', 'signed_grudge_minus_debit'):
+            voi_0_on_0 = voi(0, 0)
+            voi_1_on_1 = voi(1, 1)
+        else:
+            voi_0_on_0 = jp.zeros_like(voi_0_on_1)
+            voi_1_on_1 = jp.zeros_like(voi_1_on_0)
 
         def previous_discounted_sum(delta):
             def body(carry, delta_t):
