@@ -43,7 +43,7 @@ def tree_unstack(xs, B):
     return episodes
 
 
-class EpisodeReplayBuffer:
+class EpisodeReplayBuffer:git
     def __init__(self, capacity):
         self.capacity = capacity
         self.buffer = collections.deque(maxlen=capacity)

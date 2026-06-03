@@ -237,8 +237,7 @@ class CoinStateValuePredictor(nn.Module):
 
 class DiscreteTransitionPredictor(nn.Module):
     hidden_size: int
-    num_channels: int
-    num_classes: int
+    num_classes_by_factor: tuple
 
     @nn.compact
     def __call__(self, x):
@@ -246,6 +245,10 @@ class DiscreteTransitionPredictor(nn.Module):
         x = nn.relu(x)
         x = nn.Dense(self.hidden_size)(x)
         x = nn.relu(x)
-        logits = nn.Dense(self.num_channels * self.num_classes)(x)
-        logits = logits.reshape((-1, self.num_channels, self.num_classes))
-        return nn.log_softmax(logits, axis=-1)
+        logits = nn.Dense(sum(self.num_classes_by_factor))(x)
+        split_indices = tuple(
+            sum(self.num_classes_by_factor[:factor_idx])
+            for factor_idx in range(1, len(self.num_classes_by_factor))
+        )
+        logits_by_factor = jp.split(logits, split_indices, axis=-1)
+        return tuple(nn.log_softmax(factor_logits, axis=-1) for factor_logits in logits_by_factor)

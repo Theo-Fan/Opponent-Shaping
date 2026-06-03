@@ -172,7 +172,24 @@ def build_influence_training_data(episodes, gamma):
         [joint_actions[:, :, 0:1].astype(states.dtype), states_flat, time_remaining],
         axis=-1,
     )
-    transition_labels = states[:, 1:].reshape(batch_size, trace_length - 1, states.shape[2], -1).argmax(axis=-1)
+    width = states.shape[-1]
+    num_position_classes = states.shape[-2] * width
+    next_player0_position = episodes['player1_pos'][:, 1:-1]
+    next_player1_position = episodes['player2_pos'][:, 1:-1]
+    next_coin_position = episodes['coin_pos'][:, 1:-1]
+    next_coin_owner = episodes['coin_owner'][:, 1:-1, 0]
+
+    def flatten_position(position):
+        return position[..., 0] * width + position[..., 1]
+
+    transition_labels = jp.stack(
+        [
+            flatten_position(next_player0_position),
+            flatten_position(next_player1_position),
+            next_coin_owner * num_position_classes + flatten_position(next_coin_position),
+        ],
+        axis=-1,
+    )
 
     return {
         'state_inputs': states.reshape(batch_size * trace_length, -1),
@@ -269,8 +286,12 @@ def make_classifier_train_fn(model, optimizer, batch_size, num_steps):
         num_samples = inputs.shape[0]
 
         def loss_fn(p, x, y):
-            logp = model.apply(p, x)
-            return -jp.take_along_axis(logp, y[..., None], axis=-1)[..., 0].mean()
+            logps = model.apply(p, x)
+            losses = [
+                -jp.take_along_axis(logp, y[:, factor_idx, None], axis=-1)[..., 0].mean()
+                for factor_idx, logp in enumerate(logps)
+            ]
+            return jp.stack(losses).mean()
 
         def body(carry, _):
             p, state, step_rng = carry
@@ -352,7 +373,7 @@ def make_compute_reciprocal_reward_fn(
         transition_model,
         state_value_model,
         possible_states,
-        num_transition_classes,
+        transition_class_sizes,
         reward_type,
         normalize_reciprocal_reward,
 ):
@@ -367,16 +388,15 @@ def make_compute_reciprocal_reward_fn(
         full_transition_logp = transition_model.apply(params['transition'], data['full_inputs'])
         cf_inputs = (data['cf_inputs0'], data['cf_inputs1'])
         state_values = state_value_model.apply(params['state_value'], possible_states)
-        state_values = state_values.reshape((num_transition_classes,) * 4 + (2,))
+        state_values = state_values.reshape((*transition_class_sizes, 2))
 
         def expected_transition_value(transition_logp):
-            probs = jp.exp(transition_logp)
+            probs = tuple(jp.exp(factor_logp) for factor_logp in transition_logp)
             return jp.einsum(
-                'na,nb,nc,nd,abcdp->np',
-                probs[:, 0],
-                probs[:, 1],
-                probs[:, 2],
-                probs[:, 3],
+                'na,nb,nc,abcp->np',
+                probs[0],
+                probs[1],
+                probs[2],
                 state_values,
                 optimize='optimal',
             )
@@ -543,26 +563,38 @@ def append_reciprocator_metric_row(csv_path, row):
         writer.writerow(full_row)
 
 
-def make_possible_coin_states(obs_shape):
-    num_channels, height, width = obs_shape
-    num_classes = height * width
+def make_possible_single_coin_states(obs_shape):
+    _, height, width = obs_shape
+    num_position_classes = height * width
+    coin_classes = 2 * num_position_classes
     labels = jp.stack(
-        jp.meshgrid(*[jp.arange(num_classes)] * num_channels, indexing='ij'),
+        jp.meshgrid(
+            jp.arange(num_position_classes),
+            jp.arange(num_position_classes),
+            jp.arange(coin_classes),
+            indexing='ij',
+        ),
         axis=-1,
-    ).reshape(-1, num_channels)
-    return jax.nn.one_hot(labels, num_classes).reshape(-1, num_channels, height, width)
+    ).reshape(-1, 3)
+    player_channels = jax.nn.one_hot(labels[:, :2], num_position_classes)
+    coin_channels = jax.nn.one_hot(labels[:, 2], coin_classes).reshape(-1, 2, num_position_classes)
+    return jp.concatenate([player_channels, coin_channels], axis=1).reshape(-1, 4, height, width)
 
 
 def initialize_value_of_influence(rng, obs_shape, hp):
     influence_hp = hp['reciprocator']['influence']
     hidden_size = int(influence_hp['hidden_size'])
-    num_channels, height, width = obs_shape
-    num_transition_classes = height * width
+    _, height, width = obs_shape
+    num_position_classes = height * width
+    transition_class_sizes = (
+        num_position_classes,
+        num_position_classes,
+        2 * num_position_classes,
+    )
     scalar_model = ScalarPredictor(hidden_size=hidden_size, output_size=2)
     transition_model = DiscreteTransitionPredictor(
         hidden_size=hidden_size,
-        num_channels=num_channels,
-        num_classes=num_transition_classes,
+        num_classes_by_factor=transition_class_sizes,
     )
     state_value_model = CoinStateValuePredictor(
         obs_shape=obs_shape,
@@ -613,8 +645,8 @@ def initialize_value_of_influence(rng, obs_shape, hp):
         scalar_model,
         transition_model,
         state_value_model,
-        make_possible_coin_states(obs_shape),
-        num_transition_classes,
+        make_possible_single_coin_states(obs_shape),
+        transition_class_sizes,
         hp['reciprocator']['reciprocal_reward_type'],
         bool(hp['reciprocator']['normalize_reciprocal_reward']),
     )
@@ -822,7 +854,10 @@ def get_expected_metrics_csv_rows(hp):
 
 
 def slim_episode_for_influence(episodes):
-    return {key: episodes[key] for key in ('obs', 'act', 'rew')}
+    return {
+        key: episodes[key]
+        for key in ('obs', 'act', 'rew', 'coin_owner', 'coin_pos', 'player1_pos', 'player2_pos')
+    }
 
 
 def train(hp, log_wandb):
