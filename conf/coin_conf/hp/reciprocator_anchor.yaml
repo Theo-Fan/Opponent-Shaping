@@ -1,0 +1,15 @@
+defaults:
+  - reciprocator_fast
+  - _self_
+
+# Independent self-play with a policy anchor. When both agents discover a
+# sufficiently high same-color pickup ratio, the current policies are kept as a
+# behavioral anchor and later PPO updates are softly regularized toward them.
+reciprocator:
+  policy_anchor:
+    enabled: True
+    score_metric: min
+    min_p_same: 0.60
+    improvement_margin: 0.01
+    kl_weight: 0.10
+    start_timestep: 2000000

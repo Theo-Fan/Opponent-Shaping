@@ -125,6 +125,11 @@ For a faster profile that keeps the full influence-estimator training budget and
 python reciprocator_coin_train.py hp=reciprocator_fast wandb.state=enabled "wandb.tags=[coin,reciprocator_3x3,fast]"
 ```
 
+For a profile that softly anchors policies after both agents discover a high same-color pickup ratio:
+```bash
+python reciprocator_coin_train.py hp=reciprocator_anchor wandb.state=enabled "wandb.tags=[coin,reciprocator_3x3,anchor]"
+```
+
 Run a short smoke test without W&B:
 ```bash
 python reciprocator_coin_train.py hp=reciprocator wandb.state=disabled hp.batch_size=1 hp.max_train_timestep=200 hp.reciprocator.influence.num_initialization_iterations=0 hp.reciprocator.influence.target_period=1 hp.reciprocator.influence.target_epochs=1 hp.reciprocator.influence.num_train_batches=1 hp.reciprocator.influence.target_batch_size=32 hp.reciprocator.policy.ppo_epochs=1 hp.save_every=999999 hp.eval_every=999999

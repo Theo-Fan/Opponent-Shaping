@@ -62,6 +62,12 @@ RECIPROCAL_METRIC_FIELDNAMES = [
     'loss_ppo_value',
     'ppo_entropy',
     'grad_ppo_norm',
+    'policy_anchor_kl',
+    'policy_anchor_loss',
+    'policy_anchor_active',
+    'policy_anchor_score',
+    'policy_anchor_best_score',
+    'policy_anchor_update',
     'loss_voi_state_value',
     'loss_voi_reward',
     'loss_voi_transition',
@@ -314,9 +320,18 @@ def make_classifier_train_fn(model, optimizer, batch_size, num_steps):
     return train
 
 
-def make_update_policy_fn(optimizer, gamma, eps_clip, entropy_weight, num_epochs, clip_grad_norm, player):
+def make_update_policy_fn(
+        optimizer,
+        gamma,
+        eps_clip,
+        entropy_weight,
+        num_epochs,
+        clip_grad_norm,
+        policy_anchor_kl_weight,
+        player,
+):
     @jax.jit
-    def update(agent, opt_state, episodes, rewards):
+    def update(agent, opt_state, episodes, rewards, policy_anchor_agent, policy_anchor_active):
         data = build_ppo_training_data(episodes, rewards, gamma, player)
 
         def loss_fn(a):
@@ -335,11 +350,24 @@ def make_update_policy_fn(optimizer, gamma, eps_clip, entropy_weight, num_epochs
             policy_loss = -jp.minimum(surrogate1, surrogate2).mean()
             value_loss = jp.square(value_seq - data['return_seq']).mean()
             entropy = categorical_entropy(logp_seq).mean()
-            total_loss = policy_loss + 0.5 * value_loss - entropy_weight * entropy
+            if policy_anchor_kl_weight > 0:
+                anchor_outputs = jax.vmap(
+                    lambda obs: policy_anchor_agent.call_seq({'obs_seq': obs})
+                )(data['obs_seq'])
+                anchor_logp_seq = jax.lax.stop_gradient(anchor_outputs['logp_seq'])
+                anchor_probs = jp.exp(anchor_logp_seq)
+                policy_anchor_kl = (anchor_probs * (anchor_logp_seq - logp_seq)).sum(axis=-1).mean()
+                policy_anchor_loss = policy_anchor_active * policy_anchor_kl_weight * policy_anchor_kl
+            else:
+                policy_anchor_kl = jp.array(0.0)
+                policy_anchor_loss = jp.array(0.0)
+            total_loss = policy_loss + 0.5 * value_loss - entropy_weight * entropy + policy_anchor_loss
             return total_loss, {
                 'loss_ppo_policy': policy_loss,
                 'loss_ppo_value': value_loss,
                 'ppo_entropy': entropy,
+                'policy_anchor_kl': policy_anchor_kl,
+                'policy_anchor_loss': policy_anchor_loss,
             }
 
         def epoch_body(carry, _):
@@ -366,6 +394,62 @@ def make_update_policy_fn(optimizer, gamma, eps_clip, entropy_weight, num_epochs
         return agent, opt_state, metrics
 
     return update
+
+
+def get_policy_anchor_config(hp):
+    return hp['reciprocator'].get('policy_anchor', {})
+
+
+def is_policy_anchor_enabled(hp):
+    return bool(get_policy_anchor_config(hp).get('enabled', False))
+
+
+def policy_anchor_scalar(value):
+    return float(np.asarray(value))
+
+
+def get_policy_anchor_score(metric_row, score_metric):
+    p_same0 = float(metric_row['same_color_pickup_ratio_player0'])
+    p_same1 = float(metric_row['same_color_pickup_ratio_player1'])
+    if score_metric == 'min':
+        return min(p_same0, p_same1)
+    if score_metric == 'mean':
+        return (p_same0 + p_same1) / 2
+    if score_metric == 'agent0':
+        return p_same0
+    if score_metric == 'agent1':
+        return p_same1
+    raise ValueError(f'Unknown policy_anchor.score_metric {score_metric}')
+
+
+def maybe_update_policy_anchor(state, metric_row, completed_timesteps, hp, anchor_agent0, anchor_agent1):
+    anchor_hp = get_policy_anchor_config(hp)
+    enabled = bool(anchor_hp.get('enabled', False))
+    score_metric = str(anchor_hp.get('score_metric', 'min'))
+    score = get_policy_anchor_score(metric_row, score_metric)
+    best_score = policy_anchor_scalar(state['policy_anchor_best_score'])
+    active = policy_anchor_scalar(state['policy_anchor_active'])
+    did_update = False
+
+    if enabled and completed_timesteps >= int(anchor_hp.get('start_timestep', 0)):
+        min_p_same = float(anchor_hp.get('min_p_same', 0.0))
+        improvement_margin = float(anchor_hp.get('improvement_margin', 0.0))
+        improved = active <= 0 or score >= best_score + improvement_margin
+        if score >= min_p_same and improved:
+            state['policy_anchor_agent0'] = anchor_agent0
+            state['policy_anchor_agent1'] = anchor_agent1
+            state['policy_anchor_best_score'] = jp.array(score, dtype=jp.float32)
+            state['policy_anchor_active'] = jp.array(1.0, dtype=jp.float32)
+            best_score = score
+            active = 1.0
+            did_update = True
+
+    return {
+        'policy_anchor_active': active,
+        'policy_anchor_score': score,
+        'policy_anchor_best_score': best_score,
+        'policy_anchor_update': float(did_update),
+    }
 
 
 def make_compute_reciprocal_reward_fn(
@@ -741,6 +825,12 @@ def set_up_state_from_config(hp):
     rng, agent0_rng, agent1_rng, voi_rng = rax.split(rax.PRNGKey(hp['seed']), 4)
 
     policy_hp = hp['reciprocator']['policy']
+    policy_anchor_hp = get_policy_anchor_config(hp)
+    policy_anchor_kl_weight = (
+        float(policy_anchor_hp.get('kl_weight', 0.0))
+        if bool(policy_anchor_hp.get('enabled', False))
+        else 0.0
+    )
     policy_model = policy_hp.get('model', 'conv_gru')
     if policy_model == 'conv_gru':
         agent_module = ConvGRUActorCriticCoinAgent(
@@ -790,6 +880,7 @@ def set_up_state_from_config(hp):
         float(policy_hp['entropy_weight']),
         int(policy_hp['ppo_epochs']),
         float(policy_hp['clip_grad_norm']) if 'clip_grad_norm' in policy_hp else None,
+        policy_anchor_kl_weight,
         player=0,
     )
     update_policy1 = make_update_policy_fn(
@@ -799,6 +890,7 @@ def set_up_state_from_config(hp):
         float(policy_hp['entropy_weight']),
         int(policy_hp['ppo_epochs']),
         float(policy_hp['clip_grad_norm']) if 'clip_grad_norm' in policy_hp else None,
+        policy_anchor_kl_weight,
         player=1,
     )
     state = {
@@ -810,6 +902,10 @@ def set_up_state_from_config(hp):
         'voi': voi_state,
         'update_policy0': update_policy0,
         'update_policy1': update_policy1,
+        'policy_anchor_agent0': agent0,
+        'policy_anchor_agent1': agent1,
+        'policy_anchor_active': jp.array(0.0, dtype=jp.float32),
+        'policy_anchor_best_score': jp.array(-1.0, dtype=jp.float32),
     }
     return state, carries
 
@@ -841,6 +937,18 @@ def validate_reciprocator_config(hp):
         raise ValueError('This Reciprocator entry expects 200 steps per episode, matching the LOQA self-play setup.')
     if int(hp['seed']) < 0:
         raise ValueError('hp.seed must be a non-negative integer.')
+    policy_anchor_hp = hp['reciprocator'].get('policy_anchor', {})
+    if bool(policy_anchor_hp.get('enabled', False)):
+        if str(policy_anchor_hp.get('score_metric', 'min')) not in ('min', 'mean', 'agent0', 'agent1'):
+            raise ValueError('hp.reciprocator.policy_anchor.score_metric must be one of min, mean, agent0, agent1.')
+        if not 0 <= float(policy_anchor_hp.get('min_p_same', 0.0)) <= 1:
+            raise ValueError('hp.reciprocator.policy_anchor.min_p_same must be in [0, 1].')
+        if float(policy_anchor_hp.get('improvement_margin', 0.0)) < 0:
+            raise ValueError('hp.reciprocator.policy_anchor.improvement_margin must be non-negative.')
+        if float(policy_anchor_hp.get('kl_weight', 0.0)) <= 0:
+            raise ValueError('hp.reciprocator.policy_anchor.kl_weight must be positive when enabled.')
+        if int(policy_anchor_hp.get('start_timestep', 0)) < 0:
+            raise ValueError('hp.reciprocator.policy_anchor.start_timestep must be non-negative.')
     if get_total_training_timesteps(hp) == 30_000_000 and get_expected_metrics_csv_rows(hp) != 7500:
         raise ValueError('A 3e7-timestep Reciprocator run must be configured to write exactly 7500 CSV rows.')
 
@@ -910,6 +1018,8 @@ def train(hp, log_wandb):
 
     for i in range(num_training_iterations):
         state['rng'], rng = rax.split(state['rng'])
+        metric_anchor_agent0 = state['agent0']
+        metric_anchor_agent1 = state['agent1']
         episodes = generate_selfplay_episodes(state['agent0'], state['agent1'], carries, rng, hp)
         target_buffer.append(slim_episode_for_influence(episodes))
         metric_window_batches.append(episodes)
@@ -947,12 +1057,16 @@ def train(hp, log_wandb):
                 state['agent0_opt'].opt_state,
                 episodes,
                 total_rewards,
+                state['policy_anchor_agent0'],
+                state['policy_anchor_active'],
             )
             new_agent1, new_opt_state1, ppo_metrics1 = state['update_policy1'](
                 state['agent1'],
                 state['agent1_opt'].opt_state,
                 episodes,
                 total_rewards,
+                state['policy_anchor_agent1'],
+                state['policy_anchor_active'],
             )
             state['agent0'] = new_agent0
             state['agent1'] = new_agent1
@@ -987,6 +1101,16 @@ def train(hp, log_wandb):
                 values = [row[key] for row in metric_window_update_rows if key in row]
                 if values:
                     metric_row[key] = float(np.mean(values))
+            metric_row.update(
+                maybe_update_policy_anchor(
+                    state,
+                    metric_row,
+                    completed_timesteps,
+                    hp,
+                    metric_anchor_agent0,
+                    metric_anchor_agent1,
+                )
+            )
 
             append_reciprocator_metric_row(iteration_metrics_csv_path, metric_row)
             if log_wandb:
@@ -1013,6 +1137,10 @@ def train(hp, log_wandb):
             minimal_state = {
                 'agent0': npify(state['agent0']),
                 'agent1': npify(state['agent1']),
+                'policy_anchor_agent0': npify(state['policy_anchor_agent0']),
+                'policy_anchor_agent1': npify(state['policy_anchor_agent1']),
+                'policy_anchor_active': npify(state['policy_anchor_active']),
+                'policy_anchor_best_score': npify(state['policy_anchor_best_score']),
                 'voi_params': npify(state['voi']['params']),
                 'hp': hp,
             }
