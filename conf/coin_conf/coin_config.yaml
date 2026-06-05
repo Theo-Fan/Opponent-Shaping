@@ -25,7 +25,7 @@ wandb:
   state: disabled
   project: memory_sweep
   group: coingame_selfplay
-  run_name: self-play_{algorithm}_seed{seed}
+  run_name: selfplay_{algorithm}_seed{seed}
   mode: online
   tags:
     - test

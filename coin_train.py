@@ -61,6 +61,7 @@ class EpisodeReplayBuffer:
 
 DEFAULT_NUM_TRAINING_ITERATIONS = 10000
 DEFAULT_METRICS_LOG_TIMESTEP_FREQ = 4000
+BUCKETED_METRIC_AGENT_NAMES = {'loqa', 'nlppo'}
 MAX_TRAIN_TIMESTEP_KEYS = (
     'max_train_timestep',
     'max_train_timesteps',
@@ -216,7 +217,9 @@ def format_wandb_metrics(row):
 
 def get_wandb_run_name(hp, wandb_cfg):
     algorithm = str(hp['agent_0']).upper()
-    template = wandb_cfg.get('run_name') or 'self-play_{algorithm}_seed{seed}'
+    template = wandb_cfg.get('run_name') or 'selfplay_{algorithm}_seed{seed}'
+    if str(hp.get('agent_0', '')).lower() == 'loqa' and hp.get('just_self_play', False):
+        template = 'selfplay_LOQA_seed{seed}'
     return str(template).format(algorithm=algorithm, seed=int(hp['seed']))
 
 
@@ -311,10 +314,36 @@ def get_metrics_log_timestep_freq(hp):
     return freq
 
 
+def use_bucketed_metric_logging(hp):
+    agent_names = [str(hp.get('agent_0', '')).lower()]
+    if not hp.get('just_self_play', False):
+        agent_names.append(str(hp.get('agent_1', '')).lower())
+    if not all(name in BUCKETED_METRIC_AGENT_NAMES for name in agent_names):
+        return False
+    if any(name == 'nlppo' for name in agent_names):
+        return True
+    return hp.get('differentiable_opponent', {}).get('method') == 'loaded-dice'
+
+
+def get_metric_episodes_per_row(hp):
+    metric_timesteps = get_metrics_log_timestep_freq(hp)
+    episode_length = int(hp['game']['game_length'])
+    if metric_timesteps % episode_length != 0:
+        raise ValueError(
+            f'metrics_log_timestep_freq={metric_timesteps} must be divisible by '
+            f'episode_length={episode_length} so CSV/W&B rows are built from complete episodes.'
+        )
+    return metric_timesteps // episode_length
+
+
 def tree_concatenate(xs):
     if len(xs) == 1:
         return xs[0]
     return jax.tree_util.tree_map(lambda *args: jp.concatenate(args, axis=0), *xs)
+
+
+def slice_episode_batch(episodes, start, end):
+    return jax.tree_util.tree_map(lambda x: x[start:end], episodes)
 
 
 def scalar_mean(value):
@@ -615,6 +644,8 @@ def train(hp, log_wandb):
     episode_length = int(hp['game']['game_length'])
     total_training_timesteps = get_total_training_timesteps(hp)
     metrics_log_timestep_freq = get_metrics_log_timestep_freq(hp)
+    bucketed_metric_logging = use_bucketed_metric_logging(hp)
+    metric_episodes_per_row = get_metric_episodes_per_row(hp) if bucketed_metric_logging else None
     state, carries = set_up_state_from_config(hp)
     # print all the keys in state
     print('state keys:', state.keys())
@@ -628,7 +659,13 @@ def train(hp, log_wandb):
     print(f'total training episodes: {total_training_episodes}')
     print(f'total training timesteps: {total_training_timesteps}')
     print(f'metrics log timestep frequency: {metrics_log_timestep_freq}')
-    if metrics_log_timestep_freq % timesteps_per_iteration != 0:
+    print(f'bucketed metric logging: {bucketed_metric_logging}')
+    if bucketed_metric_logging:
+        print(
+            f'metric episodes per CSV/W&B row: {metric_episodes_per_row} '
+            f'({metric_episodes_per_row} episodes x {episode_length} timesteps)'
+        )
+    elif metrics_log_timestep_freq % timesteps_per_iteration != 0:
         print(
             'WARNING: metrics_log_timestep_freq is not an exact multiple of '
             'timesteps_per_iteration; metrics will be flushed on the first full '
@@ -653,6 +690,9 @@ def train(hp, log_wandb):
     window_start_timestep = 0
     completed_episodes = 0
     completed_timesteps = 0
+    logged_episodes = 0
+    logged_timesteps = 0
+    metric_window_episode_count = 0
     last_metric_timestep = 0
 
     for i in range(num_training_iterations):
@@ -710,7 +750,8 @@ def train(hp, log_wandb):
         episode_batches = [episodes[0]]
         if not just_self_play:
             episode_batches.append(episodes[1])
-        metric_window_batches.extend(episode_batches)
+        if not bucketed_metric_logging:
+            metric_window_batches.extend(episode_batches)
 
         # --- training actors ---
         def get_agent_update(player_id):
@@ -767,40 +808,113 @@ def train(hp, log_wandb):
                 'grad_agent1_norm': scalar_mean(grad_agent1_norm),
                 'grad_opponent1_norm': scalar_mean(grad_opponent1_norm),
             })
-        metric_window_update_rows.append(update_metric_row)
 
-        should_log_metrics = (
-            completed_timesteps - last_metric_timestep >= metrics_log_timestep_freq
-            or i == num_training_iterations - 1
-        )
-        if should_log_metrics:
-            metric_window_episodes = tree_concatenate(metric_window_batches)
-            metric_window_stats = episode_stats_jitted(metric_window_episodes)
-            metric_row = compute_iteration_metric_row(
-                episode_batches=metric_window_batches,
-                iteration=i,
-                episode=completed_episodes,
-                timestep=completed_timesteps,
-                window_start_iteration=window_start_iteration,
-                window_start_episode=window_start_episode,
-                window_start_timestep=window_start_timestep,
-                statistics=metric_window_stats,
+        if bucketed_metric_logging:
+            for batch in episode_batches:
+                batch_size = batch['rew'].shape[0]
+                start = 0
+                while start < batch_size:
+                    if metric_window_episode_count == 0:
+                        window_start_iteration = i
+                        window_start_episode = logged_episodes
+                        window_start_timestep = logged_timesteps
+
+                    needed = metric_episodes_per_row - metric_window_episode_count
+                    end = min(batch_size, start + needed)
+                    metric_window_batches.append(slice_episode_batch(batch, start, end))
+                    metric_window_update_rows.append(update_metric_row)
+                    metric_window_episode_count += end - start
+                    start = end
+
+                    if metric_window_episode_count == metric_episodes_per_row:
+                        logged_episodes += metric_episodes_per_row
+                        logged_timesteps += metrics_log_timestep_freq
+                        metric_window_episodes = tree_concatenate(metric_window_batches)
+                        metric_window_stats = episode_stats_jitted(metric_window_episodes)
+                        metric_row = compute_iteration_metric_row(
+                            episode_batches=metric_window_batches,
+                            iteration=i,
+                            episode=logged_episodes,
+                            timestep=logged_timesteps,
+                            window_start_iteration=window_start_iteration,
+                            window_start_episode=window_start_episode,
+                            window_start_timestep=window_start_timestep,
+                            statistics=metric_window_stats,
+                        )
+                        for key in TRAIN_UPDATE_METRICS_FIELDNAMES:
+                            values = [row[key] for row in metric_window_update_rows if key in row]
+                            if values:
+                                metric_row[key] = float(np.mean(values))
+
+                        append_iteration_metric_row(iteration_metrics_csv_path, metric_row)
+                        if log_wandb:
+                            wandb.log(format_wandb_metrics(metric_row), step=logged_timesteps)
+
+                        metric_window_batches = []
+                        metric_window_update_rows = []
+                        metric_window_episode_count = 0
+
+            if i == num_training_iterations - 1 and metric_window_episode_count > 0:
+                logged_episodes += metric_window_episode_count
+                logged_timesteps += metric_window_episode_count * episode_length
+                metric_window_episodes = tree_concatenate(metric_window_batches)
+                metric_window_stats = episode_stats_jitted(metric_window_episodes)
+                metric_row = compute_iteration_metric_row(
+                    episode_batches=metric_window_batches,
+                    iteration=i,
+                    episode=logged_episodes,
+                    timestep=logged_timesteps,
+                    window_start_iteration=window_start_iteration,
+                    window_start_episode=window_start_episode,
+                    window_start_timestep=window_start_timestep,
+                    statistics=metric_window_stats,
+                )
+                for key in TRAIN_UPDATE_METRICS_FIELDNAMES:
+                    values = [row[key] for row in metric_window_update_rows if key in row]
+                    if values:
+                        metric_row[key] = float(np.mean(values))
+
+                append_iteration_metric_row(iteration_metrics_csv_path, metric_row)
+                if log_wandb:
+                    wandb.log(format_wandb_metrics(metric_row), step=logged_timesteps)
+
+                metric_window_batches = []
+                metric_window_update_rows = []
+                metric_window_episode_count = 0
+        else:
+            metric_window_update_rows.append(update_metric_row)
+            should_log_metrics = (
+                completed_timesteps - last_metric_timestep >= metrics_log_timestep_freq
+                or i == num_training_iterations - 1
             )
-            for key in TRAIN_UPDATE_METRICS_FIELDNAMES:
-                values = [row[key] for row in metric_window_update_rows if key in row]
-                if values:
-                    metric_row[key] = float(np.mean(values))
+            if should_log_metrics:
+                metric_window_episodes = tree_concatenate(metric_window_batches)
+                metric_window_stats = episode_stats_jitted(metric_window_episodes)
+                metric_row = compute_iteration_metric_row(
+                    episode_batches=metric_window_batches,
+                    iteration=i,
+                    episode=completed_episodes,
+                    timestep=completed_timesteps,
+                    window_start_iteration=window_start_iteration,
+                    window_start_episode=window_start_episode,
+                    window_start_timestep=window_start_timestep,
+                    statistics=metric_window_stats,
+                )
+                for key in TRAIN_UPDATE_METRICS_FIELDNAMES:
+                    values = [row[key] for row in metric_window_update_rows if key in row]
+                    if values:
+                        metric_row[key] = float(np.mean(values))
 
-            append_iteration_metric_row(iteration_metrics_csv_path, metric_row)
-            if log_wandb:
-                wandb.log(format_wandb_metrics(metric_row), step=completed_timesteps)
+                append_iteration_metric_row(iteration_metrics_csv_path, metric_row)
+                if log_wandb:
+                    wandb.log(format_wandb_metrics(metric_row), step=completed_timesteps)
 
-            metric_window_batches = []
-            metric_window_update_rows = []
-            last_metric_timestep = completed_timesteps
-            window_start_iteration = i + 1
-            window_start_episode = completed_episodes
-            window_start_timestep = completed_timesteps
+                metric_window_batches = []
+                metric_window_update_rows = []
+                last_metric_timestep = completed_timesteps
+                window_start_iteration = i + 1
+                window_start_episode = completed_episodes
+                window_start_timestep = completed_timesteps
 
         # ---- reset agents ----
         if hp['reset']['mode'] == 'disabled':
